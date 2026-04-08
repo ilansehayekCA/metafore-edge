@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "metafore/mqtt/route_command",
+  "title": "Route Execution Command",
+  "description": "Published by Core to control/{tenant_id}/{controller_id}/routes",
+  "type": "object",
+  "required": ["action", "route_id"],
+  "properties": {
+    "action": { "type": "string", "enum": ["deploy", "execute", "remove"] },
+    "route_id": { "type": "string" },
+    "route_yaml": { "type": "string", "description": "YAML route definition (for deploy)" },
+    "parameters": {
+      "type": "object",
+      "description": "Route execution parameters including DB credentials, SQL, etc.",
+      "properties": {
+        "db_name": { "type": "string" },
+        "db_host": { "type": "string" },
+        "db_port": { "type": ["string", "integer"] },
+        "db_user": { "type": "string" },
+        "db_pass": { "type": "string" },
+        "sql": { "type": "string" },
+        "shell_command": { "type": "string" },
+        "url": { "type": "string", "description": "Target URL for HTTP routes" },
+        "http_method": { "type": "string", "enum": ["GET", "POST", "PUT", "DELETE"] },
+        "http_headers": { "type": "object" },
+        "http_body": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "response_topic": { "type": "string", "description": "MQTT topic to publish result to" }
+  },
+  "additionalProperties": false
+}

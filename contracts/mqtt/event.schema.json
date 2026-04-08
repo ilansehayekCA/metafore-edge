@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "metafore/mqtt/event",
+  "title": "Edge Controller Event",
+  "description": "Published by Edge Controller to telemetry/{tenant_id}/{controller_id}/events",
+  "type": "object",
+  "required": ["event_id", "controller_id", "tenant_id", "timestamp", "severity"],
+  "properties": {
+    "event_id": { "type": "string", "format": "uuid" },
+    "controller_id": { "type": "string" },
+    "tenant_id": { "type": "string" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "severity": { "type": "string", "enum": ["info", "warn", "error", "critical"] },
+    "component": { "type": "string" },
+    "log_source": { "type": "string" },
+    "raw_message": { "type": "string" }
+  },
+  "additionalProperties": false
+}

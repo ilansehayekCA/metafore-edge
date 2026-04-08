@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "metafore/mqtt/discovery_result",
+  "title": "Discovery Result",
+  "description": "Published by Edge Controller to telemetry/{tenant_id}/{controller_id}/discovery",
+  "type": "object",
+  "required": ["controller_id", "tenant_id", "timestamp", "run_id", "trigger"],
+  "properties": {
+    "controller_id": { "type": "string" },
+    "tenant_id": { "type": "string" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "run_id": { "type": "string", "format": "uuid" },
+    "trigger": { "type": "string", "enum": ["startup", "remote", "scheduled"] },
+    "capabilities": {
+      "type": "object",
+      "properties": {
+        "os": {
+          "$ref": "#/$defs/capability_result"
+        },
+        "ports": {
+          "$ref": "#/$defs/capability_result"
+        },
+        "processes": {
+          "$ref": "#/$defs/capability_result"
+        },
+        "databases": {
+          "$ref": "#/$defs/capability_result"
+        },
+        "connectivity": {
+          "$ref": "#/$defs/capability_result"
+        }
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "capability_result": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": { "type": "string", "enum": ["success", "failed", "skipped"] },
+        "data": {},
+        "error": { "type": "string" }
+      }
+    }
+  }
+}

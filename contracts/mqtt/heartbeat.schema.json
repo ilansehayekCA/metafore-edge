@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "metafore/mqtt/heartbeat",
+  "title": "Edge Controller Heartbeat",
+  "description": "Published by Edge Controller to telemetry/{tenant_id}/{controller_id}/heartbeat",
+  "type": "object",
+  "required": ["controller_id", "tenant_id", "timestamp", "status"],
+  "properties": {
+    "controller_id": { "type": "string", "description": "Unique Edge Controller identifier" },
+    "tenant_id": { "type": "string", "description": "Tenant this controller belongs to" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "status": { "type": "string", "enum": ["active", "degraded", "stopping"] },
+    "uptime_seconds": { "type": "integer", "minimum": 0 },
+    "routes_deployed": { "type": "integer", "minimum": 0 },
+    "routes_active": { "type": "integer", "minimum": 0 },
+    "db_connected": { "type": "boolean" },
+    "db_stats": {
+      "type": "object",
+      "properties": {
+        "threads_connected": { "type": "integer" },
+        "slow_queries": { "type": "integer" },
+        "uptime": { "type": "integer" }
+      }
+    }
+  },
+  "additionalProperties": false
+}

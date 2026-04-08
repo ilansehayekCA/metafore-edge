@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "metafore/mqtt/discovery_command",
+  "title": "Discovery Command",
+  "description": "Published by Core to control/{tenant_id}/{controller_id}/discovery",
+  "type": "object",
+  "required": ["trigger"],
+  "properties": {
+    "trigger": { "type": "string", "enum": ["remote", "scheduled"] },
+    "scope": {
+      "type": "object",
+      "properties": {
+        "discover_os": { "type": "boolean", "default": true },
+        "discover_ports": { "type": "boolean", "default": true },
+        "discover_processes": { "type": "boolean", "default": true },
+        "discover_docker": { "type": "boolean", "default": false },
+        "log_dirs": { "type": "array", "items": { "type": "string" } },
+        "connectivity_targets": { "type": "array", "items": { "type": "string" } },
+        "databases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["ref", "db_type", "host", "port", "db_name"],
+            "properties": {
+              "ref": { "type": "string" },
+              "db_type": { "type": "string", "enum": ["mysql", "mariadb", "postgresql", "oracle", "mssql"] },
+              "host": { "type": "string" },
+              "port": { "type": "integer" },
+              "db_name": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "response_topic": { "type": "string" }
+  },
+  "additionalProperties": false
+}
