@@ -1,0 +1,8 @@
+{
+  "controller_id": "edge-core-banking",
+  "tenant_id": "maybank-001",
+  "timestamp": "2026-04-08T12:00:00Z",
+  "status": "active",
+  "unexpected_field": "should_not_be_here",
+  "_comment": "Extra field not in schema — should fail with additionalProperties: false"
+}

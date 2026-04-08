@@ -1,0 +1,6 @@
+{
+  "controller_id": "edge-core-banking",
+  "tenant_id": "maybank-001",
+  "timestamp": "2026-04-08T12:00:00Z",
+  "_comment": "Missing required 'status' field — should fail validation"
+}

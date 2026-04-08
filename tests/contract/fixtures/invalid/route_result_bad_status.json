@@ -1,0 +1,8 @@
+{
+  "controller_id": "edge-core-banking",
+  "tenant_id": "maybank-001",
+  "route_id": "customer-portfolio",
+  "timestamp": "2026-04-08T12:01:00Z",
+  "status": "unknown_status",
+  "_comment": "Invalid status enum value — should fail validation"
+}

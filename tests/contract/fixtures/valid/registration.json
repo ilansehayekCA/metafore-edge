@@ -1,0 +1,10 @@
+{
+  "controller_id": "edge-core-banking",
+  "tenant_id": "maybank-001",
+  "timestamp": "2026-04-08T12:00:00Z",
+  "version": "1.0.0",
+  "capabilities": ["jdbc", "shell"],
+  "db_type": "mariadb",
+  "db_host": "localhost",
+  "db_port": 3306
+}

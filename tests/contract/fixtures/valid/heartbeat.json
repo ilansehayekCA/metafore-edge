@@ -1,0 +1,15 @@
+{
+  "controller_id": "edge-core-banking",
+  "tenant_id": "maybank-001",
+  "timestamp": "2026-04-08T12:00:00Z",
+  "status": "active",
+  "uptime_seconds": 3600,
+  "routes_deployed": 5,
+  "routes_active": 5,
+  "db_connected": true,
+  "db_stats": {
+    "threads_connected": 3,
+    "slow_queries": 0,
+    "uptime": 86400
+  }
+}

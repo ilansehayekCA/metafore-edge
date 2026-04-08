@@ -1,0 +1,10 @@
+{
+  "event_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "controller_id": "edge-core-banking",
+  "tenant_id": "maybank-001",
+  "timestamp": "2026-04-08T12:02:00Z",
+  "severity": "warn",
+  "component": "mariadb",
+  "log_source": "/var/log/mysql/error.log",
+  "raw_message": "Slow query detected: SELECT * FROM loan_portfolio WHERE status = 'active' (2.3s)"
+}

@@ -1,0 +1,13 @@
+{
+  "action": "execute",
+  "route_id": "customer-portfolio",
+  "parameters": {
+    "db_name": "core_banking",
+    "db_host": "localhost",
+    "db_port": 3306,
+    "db_user": "root",
+    "db_pass": "metafore123",
+    "sql": "SELECT customer_id, name, total_exposure FROM customers WHERE region IN (${user.regions})"
+  },
+  "response_topic": "telemetry/maybank-001/edge-core-banking/route-results"
+}

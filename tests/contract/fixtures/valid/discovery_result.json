@@ -1,0 +1,26 @@
+{
+  "controller_id": "edge-core-banking",
+  "tenant_id": "maybank-001",
+  "timestamp": "2026-04-08T12:00:00Z",
+  "run_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "trigger": "startup",
+  "capabilities": {
+    "os": {
+      "status": "success",
+      "data": { "hostname": "edge-core-banking", "os": "Linux 5.15" }
+    },
+    "databases": {
+      "status": "success",
+      "data": [
+        { "ref": "core_banking", "type": "mariadb", "host": "localhost", "port": 3306, "db_name": "core_banking", "reachable": true }
+      ]
+    },
+    "ports": {
+      "status": "success",
+      "data": [
+        { "port": 3306, "protocol": "mysql" },
+        { "port": 1883, "protocol": "mqtt" }
+      ]
+    }
+  }
+}

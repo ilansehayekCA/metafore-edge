@@ -1,0 +1,14 @@
+{
+  "controller_id": "edge-core-banking",
+  "tenant_id": "maybank-001",
+  "route_id": "customer-portfolio",
+  "timestamp": "2026-04-08T12:01:00Z",
+  "status": "success",
+  "action": "query",
+  "latency_ms": 45,
+  "row_count": 20,
+  "data": [
+    { "customer_id": "C001", "name": "Sime Darby", "total_exposure": 450000000 },
+    { "customer_id": "C002", "name": "Petronas", "total_exposure": 1200000000 }
+  ]
+}
