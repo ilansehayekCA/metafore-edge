@@ -1,7 +1,7 @@
 package com.metafore.edge.service;
 
 import org.apache.camel.CamelContext;
-import org.mariadb.jdbc.MariaDbPoolDataSource;
+import org.postgresql.ds.PGSimpleDataSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -23,11 +23,14 @@ public final class DataSourceRegistry {
     public void register(String name, String host, String port,
                          String dbName, String user, String password) {
         try {
-            String url = "jdbc:mariadb://" + host + ":" + port;
-            if (dbName != null && !dbName.isEmpty()) url += "/" + dbName;
-            if (user != null && !user.isEmpty()) url += "?user=" + user;
-            if (password != null && !password.isEmpty()) url += "&password=" + password;
-            MariaDbPoolDataSource ds = new MariaDbPoolDataSource(url);
+            PGSimpleDataSource ds = new PGSimpleDataSource();
+            ds.setServerNames(new String[]{host});
+            ds.setPortNumbers(new int[]{Integer.parseInt(port)});
+            if (dbName != null && !dbName.isEmpty()) ds.setDatabaseName(dbName);
+            if (user != null && !user.isEmpty()) ds.setUser(user);
+            if (password != null && !password.isEmpty()) ds.setPassword(password);
+            String url = "jdbc:postgresql://" + host + ":" + port
+                + (dbName != null && !dbName.isEmpty() ? "/" + dbName : "");
             dataSources.put(name, ds);
             camelContext.getRegistry().bind(name, ds);
             LOG.info("DataSource registered: {} -> {}", name, url);

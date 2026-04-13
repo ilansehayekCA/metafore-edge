@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git submodule:*)",
+      "Bash(ls -la /c/metafore-poc/metafore-conduit/Dockerfile*)",
+      "Bash(mvn compile:*)",
+      "Bash(mvn test:*)",
+      "Bash(mvn package:*)",
+      "Bash(timeout 5 java -jar target/metafore-edge-1.0.0-jar-with-dependencies.jar)"
+    ]
+  }
+}

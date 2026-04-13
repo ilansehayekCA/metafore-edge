@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "metafore/mqtt/registration",
+  "title": "Access Controller Registration",
+  "description": "Published by Access Controller to telemetry/{tenant_id}/{controller_id}/registration on startup",
+  "type": "object",
+  "required": ["controller_id", "tenant_id", "timestamp", "version", "capabilities"],
+  "properties": {
+    "controller_id": { "type": "string" },
+    "tenant_id": { "type": "string" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "version": { "type": "string", "description": "Access Controller software version" },
+    "capabilities": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["jdbc", "http", "shell"] },
+      "description": "Route types this controller can execute"
+    },
+    "db_type": { "type": "string", "enum": ["mariadb", "mysql", "postgresql", "oracle", "mssql", "none"] },
+    "db_host": { "type": "string" },
+    "db_port": { "type": "integer" }
+  },
+  "additionalProperties": false
+}
