@@ -20,6 +20,7 @@ public final class TopicBuilder {
     // Core -> Access Controller (control)
     public String controlRoutes()    { return control("routes"); }
     public String controlDiscovery() { return control("discovery"); }
+    public String controlWriteBack() { return control("write-back"); }
 
     private String telemetry(String suffix) {
         return "telemetry/" + tenantId + "/" + controllerId + "/" + suffix;

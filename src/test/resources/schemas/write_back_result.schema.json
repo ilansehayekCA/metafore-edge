@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "metafore/mqtt/write_back_result",
+  "title": "Write-Back Result",
+  "description": "Published by Access Controller to telemetry/{tenant_id}/{controller_id}/route-results after an HTTP write-back",
+  "type": "object",
+  "required": ["controller_id", "tenant_id", "action_id", "timestamp", "status", "http_status"],
+  "properties": {
+    "controller_id": { "type": "string" },
+    "tenant_id": { "type": "string" },
+    "action_id": { "type": "string" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "status": { "type": "string", "enum": ["success", "error"] },
+    "http_status": { "type": "integer" },
+    "response_body": { "type": "string" },
+    "old_values": { "type": "object" },
+    "new_values": { "type": "object" }
+  },
+  "additionalProperties": false
+}

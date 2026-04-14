@@ -49,4 +49,10 @@ class TopicBuilderTest {
         assertEquals("control/maybank-001/edge-core-banking/discovery",
             topics.controlDiscovery());
     }
+
+    @Test
+    void controlWriteBack() {
+        assertEquals("control/maybank-001/edge-core-banking/write-back",
+            topics.controlWriteBack());
+    }
 }

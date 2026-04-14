@@ -103,6 +103,28 @@ public final class MessageFactory {
         return msg;
     }
 
+    public static Map<String, Object> writeBackResult(EdgeConfig config,
+            String actionId, String status, int httpStatus, String responseBody,
+            Map<String, Object> oldValues, Map<String, Object> newValues) {
+        Map<String, Object> msg = new LinkedHashMap<>();
+        msg.put("controller_id", config.controllerId());
+        msg.put("tenant_id", config.tenantId());
+        msg.put("action_id", actionId);
+        msg.put("timestamp", Instant.now().toString());
+        msg.put("status", status);
+        msg.put("http_status", httpStatus);
+        if (responseBody != null) {
+            msg.put("response_body", responseBody);
+        }
+        if (oldValues != null) {
+            msg.put("old_values", oldValues);
+        }
+        if (newValues != null) {
+            msg.put("new_values", newValues);
+        }
+        return msg;
+    }
+
     public static Map<String, Object> discoveryResult(EdgeConfig config,
             String runId, String trigger, Map<String, Object> capabilities) {
         Map<String, Object> msg = new LinkedHashMap<>();

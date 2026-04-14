@@ -5,7 +5,7 @@ WORKDIR /build
 COPY pom.xml .
 RUN mvn dependency:go-offline -B
 COPY src ./src
-RUN mvn package -DskipTests -B
+RUN mvn package -DskipTests -Dmaven.test.skip=true -B
 
 # Stage 2: Runtime
 FROM public.ecr.aws/docker/library/eclipse-temurin:21-jre-alpine

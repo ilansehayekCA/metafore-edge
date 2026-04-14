@@ -97,6 +97,32 @@ class MessageFactoryTest {
     }
 
     @Test
+    void writeBackResultSuccessMatchesSchema() throws Exception {
+        Map<String, Object> msg = MessageFactory.writeBackResult(
+            config, "wb-001", "success", 200,
+            "{\"id\":\"INC001\",\"state\":\"resolved\"}",
+            Map.of("state", "open"),
+            Map.of("state", "resolved"));
+        validate(msg, "write_back_result.schema.json");
+    }
+
+    @Test
+    void writeBackResultErrorMatchesSchema() throws Exception {
+        Map<String, Object> msg = MessageFactory.writeBackResult(
+            config, "wb-002", "error", 401,
+            "Unauthorized", null, null);
+        validate(msg, "write_back_result.schema.json");
+    }
+
+    @Test
+    void writeBackResultMinimalMatchesSchema() throws Exception {
+        Map<String, Object> msg = MessageFactory.writeBackResult(
+            config, "wb-003", "error", 0,
+            "Exception: Connection refused", null, null);
+        validate(msg, "write_back_result.schema.json");
+    }
+
+    @Test
     void discoveryResultMatchesSchema() throws Exception {
         Map<String, Object> capabilities = new LinkedHashMap<>();
         capabilities.put("os", Map.of("status", "success", "data",

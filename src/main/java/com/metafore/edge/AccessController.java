@@ -44,6 +44,7 @@ public class AccessController {
         context.addRoutes(new DiscoveryRoute(config, topics));
         context.addRoutes(new RouteExecutorRoute(config, topics, dsRegistry));
         context.addRoutes(new EventRoute(config, topics));
+        context.addRoutes(new RestAdapterRoute(config, topics));
 
         context.start();
         LOG.info("Access Controller started — {} routes active", context.getRoutes().size());
