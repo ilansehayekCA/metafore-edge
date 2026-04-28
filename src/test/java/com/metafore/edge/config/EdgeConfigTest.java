@@ -16,7 +16,12 @@ class EdgeConfigTest {
         assertEquals("tcp://mqtt-broker:1883", cfg.brokerUrl());
         assertEquals("1.0.0", cfg.edgeVersion());
         assertEquals("localhost", cfg.dbHost());
-        assertEquals("3306", cfg.dbPort());
+        // Slice 33.1.0 fixture fix: EdgeConfig.dbPort defaults to 5432
+        // (PostgreSQL) since the 2026-04-12 MariaDB→PostgreSQL migration.
+        // Test fixture was stale at 3306 (MariaDB); rot was hidden by
+        // the disabled-in-CI test suite. Aligning to current production
+        // default. Matches metafore-edge/CLAUDE.md gotcha #4.
+        assertEquals("5432", cfg.dbPort());
         assertEquals("", cfg.dbName());
         assertEquals("root", cfg.dbUser());
         assertEquals("", cfg.dbPass());

@@ -84,19 +84,110 @@ public class RouteExecutorRoute extends RouteBuilder {
             return executeShell(routeId, shellCmd);
         }
 
-        // SQL execution
-        String sql = params != null ? (String) params.get("sql") : null;
-        if (sql == null && routeYaml != null) {
-            sql = extractQuery(routeYaml);
+        // Slice 33.1.0 dispatch — parametric vs legacy SQL.
+        // ``operation`` keys the new parametric path
+        // (PreparedStatement, INFORMATION_SCHEMA validation,
+        // type-supported gate). ``sql`` keys the legacy
+        // string-substitution path (kept for rolling-window
+        // compatibility with cores that haven't flipped yet).
+        // Explicit handling for both ambiguous and missing
+        // payloads — defense-in-depth at the dispatch boundary.
+        String legacySql = params != null ? (String) params.get("sql") : null;
+        if (legacySql == null && routeYaml != null) {
+            legacySql = extractQuery(routeYaml);
         }
+        PayloadKind kind = classifyPayload(params, legacySql);
+        switch (kind) {
+            case AMBIGUOUS:
+                return MessageFactory.routeResult(config, routeId,
+                    "error", null, 0, null, null, null,
+                    "Ambiguous payload: both 'operation' (parametric) "
+                    + "and 'sql' (legacy) present. Send exactly one.",
+                    null);
+            case MISSING:
+                return MessageFactory.routeResult(config, routeId,
+                    "error", null, 0, null, null, null,
+                    "Missing 'operation' (parametric path) or 'sql' "
+                    + "(legacy path) in route parameters", null);
+            case PARAMETRIC:
+                return executeParametric(routeId, params);
+            case LEGACY:
+                return executeSql(routeId, legacySql, params);
+            default:
+                throw new IllegalStateException("PayloadKind: " + kind);
+        }
+    }
 
-        if (sql == null || sql.isEmpty()) {
+    /**
+     * Slice 33.1.0 — payload-shape classifier for the dispatch
+     * boundary. Package-private so the four-state branching is
+     * directly testable without Camel scaffolding.
+     */
+    enum PayloadKind { PARAMETRIC, LEGACY, AMBIGUOUS, MISSING }
+
+    static PayloadKind classifyPayload(
+        Map<String, Object> params, String legacySql
+    ) {
+        boolean hasOperation = false;
+        if (params != null) {
+            Object op = params.get("operation");
+            if (op instanceof String) {
+                hasOperation = !((String) op).isBlank();
+            }
+        }
+        boolean hasSql = legacySql != null && !legacySql.isEmpty();
+        if (hasOperation && hasSql) return PayloadKind.AMBIGUOUS;
+        if (!hasOperation && !hasSql) return PayloadKind.MISSING;
+        return hasOperation ? PayloadKind.PARAMETRIC : PayloadKind.LEGACY;
+    }
+
+    /**
+     * Slice 33.1.0 — parametric CRUD dispatch via JDBC PreparedStatement.
+     * Reads structured payload, delegates to
+     * ``SqlExecutor.executeParametric`` which validates table +
+     * columns + value types before binding.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> executeParametric(
+        String routeId, Map<String, Object> params
+    ) {
+        DataSource ds = dsRegistry.get(routeId);
+        if (ds == null) {
             return MessageFactory.routeResult(config, routeId,
-                "error", null, 0, null, null, null,
-                "No query or command found in route definition", null);
+                "error", "execute", 0, null, null, null,
+                "No database connection available", null);
         }
 
-        return executeSql(routeId, sql, params);
+        String operation = (String) params.get("operation");
+        String tableName = (String) params.get("table_name");
+        Object colsObj = params.get("columns");
+        Object valsObj = params.get("values");
+        String whereColumn = (String) params.get("where_column");
+        Object whereValue = params.get("where_value");
+
+        if (!(colsObj instanceof List) || !(valsObj instanceof List)) {
+            return MessageFactory.routeResult(config, routeId,
+                "error", "execute", 0, null, null, null,
+                "'columns' and 'values' must be present and be lists",
+                null);
+        }
+        List<String> columns = new ArrayList<>();
+        for (Object c : (List<Object>) colsObj) {
+            columns.add(c == null ? null : c.toString());
+        }
+        List<Object> values = new ArrayList<>((List<Object>) valsObj);
+
+        Map<String, Object> execResult = SqlExecutor.executeParametric(
+            ds, operation, tableName, columns, values,
+            whereColumn, whereValue
+        );
+        String status = (String) execResult.get("status");
+        String action = (String) execResult.getOrDefault("action", "execute");
+        long latency = ((Number) execResult.get("latency_ms")).longValue();
+        Integer rowsAffected = (Integer) execResult.get("rows_affected");
+        String error = (String) execResult.get("error");
+        return MessageFactory.routeResult(config, routeId,
+            status, action, latency, null, rowsAffected, null, error, null);
     }
 
     private Map<String, Object> executeShell(String routeId, String command) {

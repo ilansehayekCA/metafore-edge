@@ -240,7 +240,7 @@ class RestAdapterRouteTest {
         @Override public SSLContext sslContext() { return null; }
         @Override public SSLParameters sslParameters() { return new SSLParameters(); }
         @Override public Optional<Authenticator> authenticator() { return Optional.empty(); }
-        @Override public Version version() { return Version.HTTP_1_1; }
+        @Override public java.net.http.HttpClient.Version version() { return java.net.http.HttpClient.Version.HTTP_1_1; }
         @Override public Optional<Executor> executor() { return Optional.empty(); }
     }
 
@@ -261,7 +261,7 @@ class RestAdapterRouteTest {
         @Override public Optional<HttpResponse<T>> previousResponse() { return Optional.empty(); }
         @Override public HttpHeaders headers() { return HttpHeaders.of(Map.of(), (a, b) -> true); }
         @Override public URI uri() { return request.uri(); }
-        @Override public Version version() { return Version.HTTP_1_1; }
+        @Override public java.net.http.HttpClient.Version version() { return java.net.http.HttpClient.Version.HTTP_1_1; }
         @Override public Optional<javax.net.ssl.SSLSession> sslSession() { return Optional.empty(); }
     }
 
@@ -269,10 +269,14 @@ class RestAdapterRouteTest {
     private static class FailingHttpClient extends StubHttpClient {
         FailingHttpClient() { super(0, ""); }
 
+        // Slice 33.1.0 — parent StubHttpClient.send is declared without
+        // ``throws IOException``; align signature here. The actual
+        // failure shape is wrapped as a RuntimeException so the test
+        // intent (server unreachable) is preserved.
         @Override
         public <T> HttpResponse<T> send(HttpRequest request,
-                HttpResponse.BodyHandler<T> responseBodyHandler) throws IOException {
-            throw new IOException("Connection refused");
+                HttpResponse.BodyHandler<T> responseBodyHandler) {
+            throw new RuntimeException(new IOException("Connection refused"));
         }
     }
 }

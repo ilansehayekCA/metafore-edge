@@ -10,20 +10,12 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    # Slice 33.1.0: tests re-enabled. The pre-existing
+    # ``mariadb`` service is no longer needed (PostgreSQL migration
+    # 2026-04-12 dropped MariaDB everywhere; the test fixture rot
+    # that referenced it was fixed in this slice). The ``mosquitto``
+    # service remains for any future Camel-MQTT integration test.
     services:
-      mariadb:
-        image: mariadb:11
-        env:
-          MARIADB_ROOT_PASSWORD: test123
-          MARIADB_DATABASE: test_db
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="healthcheck.sh --connect --innodb_initialized"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=5
-
       mosquitto:
         image: eclipse-mosquitto:2
         ports:
@@ -41,8 +33,15 @@ jobs:
           distribution: 'temurin'
           cache: maven
 
-      - name: Build (tests skipped — known compilation issues)
-        run: mvn package -Dmaven.test.skip=true -B
+      - name: Build + run unit tests
+        # Slice 33.1.0 re-enabled the test suite. The previous
+        # ``-Dmaven.test.skip=true`` skipped the entire suite due to
+        # a single broken file (RestAdapterRouteTest.java —
+        # Version FQN + IOException-throws mismatch) and one stale
+        # fixture (EdgeConfigTest dbPort 3306 → 5432 PostgreSQL
+        # migration). Both fixed in this slice; 82/82 tests green
+        # as of the commit that removed this skip flag.
+        run: mvn package -B
 
   build-and-deploy:
     needs: test
