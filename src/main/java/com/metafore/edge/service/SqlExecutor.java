@@ -167,17 +167,25 @@ public final class SqlExecutor {
                 return errorResult(start, "execute", typeError);
             }
 
+            // Slice 33.1.0c — pull column types alongside validation so
+            // bindValue can route timestamp / date columns through
+            // setTimestamp / setDate (PG refuses implicit varchar->
+            // timestamptz cast on parameter bindings).
+            Map<String, String> columnTypes = fetchColumnTypes(conn, tableName);
+
             String sql = buildSql(operation, tableName, columns, whereColumn);
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 int idx = 1;
                 if (!isSelect) {
-                    for (Object v : values) {
-                        bindValue(ps, idx++, v);
+                    for (int i = 0; i < values.size(); i++) {
+                        String colType = columnTypes.get(columns.get(i));
+                        bindValue(ps, idx++, values.get(i), colType);
                     }
                 }
                 if ("update".equals(operation) || "delete".equals(operation)
                     || isSelect) {
-                    bindValue(ps, idx, whereValue);
+                    String whereType = columnTypes.get(whereColumn);
+                    bindValue(ps, idx, whereValue, whereType);
                 }
                 if (isSelect) {
                     try (ResultSet rs = ps.executeQuery()) {
@@ -221,6 +229,44 @@ public final class SqlExecutor {
      * the missing table OR the missing column. Two queries, one
      * Connection, transactionally consistent with the caller's write.
      */
+    /**
+     * Slice 33.1.0c — fetch ``column_name -> data_type`` map for a table.
+     *
+     * Same INFORMATION_SCHEMA.columns query as
+     * {@link #validateTableAndColumns} but returns the type alongside the
+     * name. Used by {@link #bindValue} to route timestamp / date columns
+     * through ``setTimestamp`` / ``setDate`` after parsing the ISO string,
+     * since JDBC ``setString`` on a typed timestamp column does NOT
+     * trigger PG's implicit ``varchar -> timestamptz`` cast (that rule
+     * applies to text-literal SQL only, not parameter bindings).
+     *
+     * Single Connection contract: caller passes the same Connection
+     * that will subsequently bind + execute the write, so the schema
+     * view is transactionally consistent with the write.
+     *
+     * Returns ``data_type`` from INFORMATION_SCHEMA — long form
+     * (``"timestamp with time zone"`` for both ``timestamptz`` and
+     * ``timestamp with time zone`` declarations; ``"character varying"``
+     * for ``varchar``; etc.).
+     */
+    static Map<String, String> fetchColumnTypes(
+        Connection conn, String tableName
+    ) throws SQLException {
+        Map<String, String> types = new HashMap<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            + "WHERE table_schema='public' AND table_name=?"
+        )) {
+            ps.setString(1, tableName);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    types.put(rs.getString(1), rs.getString(2));
+                }
+            }
+        }
+        return types;
+    }
+
     static String validateTableAndColumns(
         Connection conn,
         String tableName,
@@ -377,8 +423,78 @@ public final class SqlExecutor {
         }
     }
 
-    private static void bindValue(PreparedStatement ps, int idx, Object v)
-        throws SQLException {
+    /**
+     * Slice 33.1.0c — column-type-aware bind.
+     *
+     * When ``columnType`` identifies a timestamp / date column AND the
+     * value is an ISO string, parses + binds via ``setTimestamp`` /
+     * ``setDate`` so PG accepts the parameter. Plain ``setString`` on a
+     * timestamp column FAILS in PG (no implicit varchar->timestamptz
+     * cast at the bind layer; that rule is for SQL text literals only).
+     *
+     * INFORMATION_SCHEMA returns the long form ``"timestamp with time
+     * zone"`` for both ``timestamptz`` and ``timestamp with time zone``
+     * declarations — single contains-check covers the family.
+     *
+     * Backwards compatibility: ``columnType=null`` (or unknown / non-
+     * timestamp) falls through to the legacy ``instanceof`` chain so
+     * non-timestamp columns + already-typed values keep working.
+     */
+    static void bindValue(
+        PreparedStatement ps, int idx, Object v, String columnType
+    ) throws SQLException {
+        if (v instanceof CharSequence && columnType != null) {
+            String s = v.toString();
+            if (columnType.equals("date")) {
+                try {
+                    ps.setDate(idx, java.sql.Date.valueOf(
+                        java.time.LocalDate.parse(s)));
+                } catch (java.time.format.DateTimeParseException e) {
+                    throw new SQLException(
+                        "Invalid ISO date string for column type 'date': "
+                        + s + " (" + e.getMessage() + ")", e);
+                }
+                return;
+            }
+            if (columnType.contains("with time zone")) {
+                try {
+                    ps.setTimestamp(idx, java.sql.Timestamp.from(
+                        java.time.OffsetDateTime.parse(s).toInstant()));
+                } catch (java.time.format.DateTimeParseException e) {
+                    throw new SQLException(
+                        "Invalid ISO timestamptz string for column type "
+                        + "'" + columnType + "': " + s
+                        + " (" + e.getMessage() + ")", e);
+                }
+                return;
+            }
+            if (columnType.contains("timestamp")) {
+                // ``timestamp without time zone`` — accept naive ISO.
+                try {
+                    ps.setTimestamp(idx, java.sql.Timestamp.valueOf(
+                        java.time.LocalDateTime.parse(s)));
+                } catch (java.time.format.DateTimeParseException e) {
+                    throw new SQLException(
+                        "Invalid ISO timestamp string for column type "
+                        + "'" + columnType + "': " + s
+                        + " (" + e.getMessage() + ")", e);
+                }
+                return;
+            }
+        }
+        bindValueLegacy(ps, idx, v);
+    }
+
+    /**
+     * Legacy bind path — preserved for backwards compatibility when
+     * column type is null/unknown OR the value is already a typed
+     * Java object (Timestamp, Date, Number, etc.). ``executeSql``
+     * doesn't go through ``bindValue`` at all, so this path is only
+     * reached from ``executeParametric``.
+     */
+    private static void bindValueLegacy(
+        PreparedStatement ps, int idx, Object v
+    ) throws SQLException {
         if (v == null) {
             ps.setObject(idx, null);
         } else if (v instanceof CharSequence) {

@@ -223,4 +223,158 @@ class SqlExecutorTest {
             "rec-1"
         ));
     }
+
+    // ── Slice 33.1.0c — column-type-aware bindValue ─────────────────
+
+    /**
+     * Hand-rolled BindCapture — Java reflection Proxy that records every
+     * method call on a PreparedStatement. Avoids adding Mockito to the
+     * edge dep tree for one slice. Mockito can land alongside the
+     * deferred Testcontainers slice when integration test infra wants
+     * broader mocking.
+     *
+     * Returns null from invoke() — fine for void setXxx methods + any
+     * Object-returning method we don't call in these tests. Primitive-
+     * returning methods (getInt, etc.) would NPE; we don't call them.
+     */
+    static final class BindCapture
+        implements java.lang.reflect.InvocationHandler {
+        static final class Call {
+            final String method;
+            final Object[] args;
+            Call(String m, Object[] a) { this.method = m; this.args = a; }
+        }
+        final java.util.List<Call> calls = new java.util.ArrayList<>();
+        public Object invoke(Object proxy, java.lang.reflect.Method m,
+                             Object[] args) {
+            calls.add(new Call(m.getName(), args));
+            return null;
+        }
+        java.sql.PreparedStatement ps() {
+            return (java.sql.PreparedStatement)
+                java.lang.reflect.Proxy.newProxyInstance(
+                    java.sql.PreparedStatement.class.getClassLoader(),
+                    new Class<?>[]{java.sql.PreparedStatement.class},
+                    this
+                );
+        }
+    }
+
+    @Test
+    void bindValueRoutesTimestamptzStringToSetTimestamp() throws Exception {
+        BindCapture cap = new BindCapture();
+        String iso = "2026-04-29T12:00:00.123456+00:00";
+        SqlExecutor.bindValue(cap.ps(), 1, iso, "timestamp with time zone");
+        assertEquals(1, cap.calls.size());
+        BindCapture.Call c = cap.calls.get(0);
+        assertEquals("setTimestamp", c.method);
+        assertEquals(Integer.valueOf(1), c.args[0]);
+        assertTrue(c.args[1] instanceof java.sql.Timestamp);
+        java.time.Instant expected = java.time.OffsetDateTime
+            .parse(iso).toInstant();
+        assertEquals(expected, ((java.sql.Timestamp) c.args[1]).toInstant());
+    }
+
+    @Test
+    void bindValueRoutesDateStringToSetDate() throws Exception {
+        BindCapture cap = new BindCapture();
+        SqlExecutor.bindValue(cap.ps(), 2, "2026-04-29", "date");
+        assertEquals(1, cap.calls.size());
+        BindCapture.Call c = cap.calls.get(0);
+        assertEquals("setDate", c.method);
+        assertEquals(Integer.valueOf(2), c.args[0]);
+        assertTrue(c.args[1] instanceof java.sql.Date);
+        assertEquals(
+            java.sql.Date.valueOf(java.time.LocalDate.parse("2026-04-29")),
+            c.args[1]
+        );
+    }
+
+    @Test
+    void bindValueRoutesNaiveTimestampStringToSetTimestamp() throws Exception {
+        // ``timestamp without time zone`` — naive ISO with no offset.
+        BindCapture cap = new BindCapture();
+        SqlExecutor.bindValue(
+            cap.ps(), 3, "2026-04-29T12:00:00.123456",
+            "timestamp without time zone"
+        );
+        assertEquals(1, cap.calls.size());
+        BindCapture.Call c = cap.calls.get(0);
+        assertEquals("setTimestamp", c.method);
+        assertEquals(
+            java.sql.Timestamp.valueOf(
+                java.time.LocalDateTime.parse("2026-04-29T12:00:00.123456")),
+            c.args[1]
+        );
+    }
+
+    @Test
+    void bindValueKeepsExistingPathForVarcharColumn() throws Exception {
+        // Regression: non-timestamp column + String value MUST still
+        // hit setString (legacy path). ISO-like strings landing on a
+        // text column don't get reinterpreted.
+        BindCapture cap = new BindCapture();
+        SqlExecutor.bindValue(
+            cap.ps(), 4, "Phluence", "character varying"
+        );
+        assertEquals(1, cap.calls.size());
+        BindCapture.Call c = cap.calls.get(0);
+        assertEquals("setString", c.method);
+        assertEquals("Phluence", c.args[1]);
+    }
+
+    @Test
+    void bindValueHandlesNullForTimestampColumn() throws Exception {
+        // Null on a timestamp column must NOT attempt ISO parse —
+        // falls through to legacy setObject(null) for clean NULL bind.
+        BindCapture cap = new BindCapture();
+        SqlExecutor.bindValue(
+            cap.ps(), 5, null, "timestamp with time zone"
+        );
+        assertEquals(1, cap.calls.size());
+        BindCapture.Call c = cap.calls.get(0);
+        assertEquals("setObject", c.method);
+        assertNull(c.args[1]);
+    }
+
+    @Test
+    void bindValueAcceptsTypedTimestampOnTimestampColumn() throws Exception {
+        // When the value is already a typed java.sql.Timestamp, the
+        // ISO-parse branch must NOT trigger (CharSequence check fails).
+        // Falls through to legacy path which binds via setTimestamp.
+        BindCapture cap = new BindCapture();
+        java.sql.Timestamp ts = java.sql.Timestamp.from(
+            java.time.Instant.parse("2026-04-29T12:00:00.123456Z"));
+        SqlExecutor.bindValue(
+            cap.ps(), 6, ts, "timestamp with time zone"
+        );
+        assertEquals(1, cap.calls.size());
+        BindCapture.Call c = cap.calls.get(0);
+        assertEquals("setTimestamp", c.method);
+        assertSame(ts, c.args[1]);
+    }
+
+    @Test
+    void bindValueFallsThroughWhenColumnTypeUnknown() throws Exception {
+        // Backwards compat: null columnType keeps the legacy path
+        // (existing 33.1.0/0a/0b callers that don't pass type).
+        BindCapture cap = new BindCapture();
+        SqlExecutor.bindValue(cap.ps(), 7, "Phluence", null);
+        assertEquals(1, cap.calls.size());
+        assertEquals("setString", cap.calls.get(0).method);
+    }
+
+    @Test
+    void bindValueRaisesOnInvalidTimestamptzString() throws Exception {
+        // Defensive: bad ISO on a timestamptz column surfaces as a
+        // SQLException naming the offending value + column type.
+        BindCapture cap = new BindCapture();
+        java.sql.SQLException exc = assertThrows(
+            java.sql.SQLException.class, () ->
+                SqlExecutor.bindValue(cap.ps(), 1,
+                    "not-an-iso-timestamp", "timestamp with time zone")
+        );
+        assertTrue(exc.getMessage().contains("timestamptz"));
+        assertTrue(exc.getMessage().contains("not-an-iso-timestamp"));
+    }
 }
