@@ -185,9 +185,16 @@ public class RouteExecutorRoute extends RouteBuilder {
         String action = (String) execResult.getOrDefault("action", "execute");
         long latency = ((Number) execResult.get("latency_ms")).longValue();
         Integer rowsAffected = (Integer) execResult.get("rows_affected");
+        // Slice 33.1.0b — ``select`` returns row_count + data; writes
+        // return rows_affected. Surface both — MessageFactory drops the
+        // null fields from the wire envelope.
+        Integer rowCount = (Integer) execResult.get("row_count");
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> data =
+            (List<Map<String, Object>>) execResult.get("data");
         String error = (String) execResult.get("error");
         return MessageFactory.routeResult(config, routeId,
-            status, action, latency, null, rowsAffected, null, error, null);
+            status, action, latency, rowCount, rowsAffected, data, error, null);
     }
 
     private Map<String, Object> executeShell(String routeId, String command) {

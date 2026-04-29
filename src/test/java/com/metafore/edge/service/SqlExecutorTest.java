@@ -169,4 +169,58 @@ class SqlExecutorTest {
         assertNotNull(err);
         assertTrue(err.contains("where_value"));
     }
+
+    // ── Slice 33.1.0b — select operation ────────────────────────────
+
+    @Test
+    void executeParametricRejectsUnknownOperationListsAllFour() {
+        // Sanity — error message should now mention all four supported
+        // operations (Slice 33.1.0b adds ``select``).
+        Map<String, Object> r = SqlExecutor.executeParametric(
+            null, "upsert", "gtm_accounts",
+            java.util.List.of("name"), java.util.List.of("Acme"),
+            null, null
+        );
+        assertEquals("error", r.get("status"));
+        assertTrue(((String) r.get("error")).contains("create/update/delete/select"));
+    }
+
+    @Test
+    void executeParametricSelectRejectsBlankWhereColumn() {
+        Map<String, Object> r = SqlExecutor.executeParametric(
+            null, "select", "gtm_accounts",
+            java.util.List.of("name", "industry"),
+            java.util.Collections.emptyList(),
+            null, "rec-1"
+        );
+        assertEquals("error", r.get("status"));
+        assertTrue(((String) r.get("error")).contains("where_column"));
+    }
+
+    @Test
+    void validateValueTypesRejectsListAsWhereValueForSelect() {
+        // ``select`` only binds where_value; ``values`` is empty.
+        // An unsupported where_value type must fail distinctly with
+        // the ``where_value`` label. validateValueTypes is the gate
+        // executeParametric calls before any DB contact.
+        String err = SqlExecutor.validateValueTypes(
+            java.util.Collections.emptyList(),
+            java.util.List.of("a", "b")  // unsupported runtime type
+        );
+        assertNotNull(err);
+        assertTrue(err.contains("Unsupported column type"));
+        assertTrue(err.contains("where_value"));
+    }
+
+    @Test
+    void validateValueTypesAcceptsEmptyValuesAndOkWhereValue() {
+        // Sanity: empty values + a string where_value passes — proves
+        // the loop doesn't trip on a 0-length list and the where_value
+        // path runs independently. (executeParametric for select goes
+        // through this exact shape.)
+        assertNull(SqlExecutor.validateValueTypes(
+            java.util.Collections.emptyList(),
+            "rec-1"
+        ));
+    }
 }

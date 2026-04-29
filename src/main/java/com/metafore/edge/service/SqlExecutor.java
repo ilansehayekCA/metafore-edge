@@ -81,6 +81,11 @@ public final class SqlExecutor {
      * - "delete": same as update (soft-delete tombstone is an UPDATE
      *   in disguise from edge's perspective; tombstone column names
      *   come through ``columns`` like any other write).
+     * - "select" (Slice 33.1.0b): SELECT cols FROM "table"
+     *   WHERE "where_col" = ?. Returns ``data`` array + ``row_count``
+     *   instead of ``rows_affected``. Adds the read half so core's
+     *   SELECT-before-UPDATE diff capture (``_persist_update``) can
+     *   flip off the legacy string-substitution path in Slice 33.1.1.
      *
      * Any column the table doesn't have, or any value of an unsupported
      * type, fails the request before any state change. Mirrors the
@@ -98,25 +103,34 @@ public final class SqlExecutor {
     ) {
         Map<String, Object> result = new LinkedHashMap<>();
         long start = System.currentTimeMillis();
+        boolean isSelect = "select".equals(operation);
 
         // Operation discriminator + payload shape gate.
-        if (!Set.of("create", "update", "delete").contains(operation)) {
+        if (!Set.of("create", "update", "delete", "select").contains(operation)) {
             return errorResult(start, "execute",
                 "Unsupported operation: " + operation
-                + " (expected create/update/delete)");
+                + " (expected create/update/delete/select)");
         }
         if (tableName == null || tableName.isBlank()) {
             return errorResult(start, "execute",
                 "Missing or empty table_name");
         }
-        if (columns == null || values == null
-            || columns.size() != values.size()) {
-            return errorResult(start, "execute",
-                "columns and values must be present and equal length"
-                + " (columns=" + (columns == null ? -1 : columns.size())
-                + ", values=" + (values == null ? -1 : values.size()) + ")");
+
+        // Slice 33.1.0b — ``select`` shape differs from write ops.
+        // ``columns`` (when non-empty) is the projection list, NOT bind
+        // values; ``values`` is unused. The columns/values length-match
+        // gate applies only to write ops.
+        if (!isSelect) {
+            if (columns == null || values == null
+                || columns.size() != values.size()) {
+                return errorResult(start, "execute",
+                    "columns and values must be present and equal length"
+                    + " (columns=" + (columns == null ? -1 : columns.size())
+                    + ", values=" + (values == null ? -1 : values.size()) + ")");
+            }
         }
-        if (("update".equals(operation) || "delete".equals(operation))
+        if (("update".equals(operation) || "delete".equals(operation)
+                || isSelect)
             && (whereColumn == null || whereColumn.isBlank())) {
             return errorResult(start, "execute",
                 operation + " requires where_column");
@@ -126,15 +140,29 @@ public final class SqlExecutor {
             // Slice 33.1.0 addition #1: distinct table/column existence
             // checks. Single Connection so the INFORMATION_SCHEMA view
             // is consistent with the subsequent write.
+            //
+            // Slice 33.1.0b — for ``select`` the projection list may be
+            // null/empty (caller wants all columns). Skip the per-column
+            // existence check in that case; the table existence check
+            // still runs, and unknown projection columns surface via
+            // PG's own "column does not exist" error if present.
+            List<String> colsToValidate = isSelect && (columns == null
+                || columns.isEmpty()) ? null : columns;
             String validationError = validateTableAndColumns(
-                conn, tableName, columns, whereColumn);
+                conn, tableName, colsToValidate, whereColumn);
             if (validationError != null) {
                 return errorResult(start, "execute", validationError);
             }
             // Slice 33.1.0 addition #2: type-supported gate. Reject
             // values whose runtime type isn't in SUPPORTED_PG_COLUMN_TYPES
             // before binding so debug surface stays small.
-            String typeError = validateValueTypes(values, whereValue);
+            //
+            // Slice 33.1.0b — ``select`` only binds ``where_value``;
+            // ``values`` is empty so the loop is a no-op anyway, but
+            // calling validateValueTypes on a null/empty list is safe.
+            String typeError = validateValueTypes(
+                isSelect ? java.util.Collections.emptyList() : values,
+                whereValue);
             if (typeError != null) {
                 return errorResult(start, "execute", typeError);
             }
@@ -142,11 +170,37 @@ public final class SqlExecutor {
             String sql = buildSql(operation, tableName, columns, whereColumn);
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 int idx = 1;
-                for (Object v : values) {
-                    bindValue(ps, idx++, v);
+                if (!isSelect) {
+                    for (Object v : values) {
+                        bindValue(ps, idx++, v);
+                    }
                 }
-                if ("update".equals(operation) || "delete".equals(operation)) {
+                if ("update".equals(operation) || "delete".equals(operation)
+                    || isSelect) {
                     bindValue(ps, idx, whereValue);
+                }
+                if (isSelect) {
+                    try (ResultSet rs = ps.executeQuery()) {
+                        ResultSetMetaData meta = rs.getMetaData();
+                        int colCount = meta.getColumnCount();
+                        List<Map<String, Object>> rows = new ArrayList<>();
+                        while (rs.next() && rows.size() < MAX_ROWS) {
+                            Map<String, Object> row = new LinkedHashMap<>();
+                            for (int i = 1; i <= colCount; i++) {
+                                Object val = rs.getObject(i);
+                                row.put(meta.getColumnLabel(i),
+                                    val != null ? val.toString() : null);
+                            }
+                            rows.add(row);
+                        }
+                        result.put("status", "success");
+                        result.put("action", "query");
+                        result.put("latency_ms",
+                            System.currentTimeMillis() - start);
+                        result.put("row_count", rows.size());
+                        result.put("data", rows);
+                        return result;
+                    }
                 }
                 int affected = ps.executeUpdate();
                 result.put("status", "success");
@@ -156,7 +210,8 @@ public final class SqlExecutor {
                 return result;
             }
         } catch (SQLException e) {
-            return errorResult(start, "execute", e.getMessage());
+            return errorResult(start, isSelect ? "query" : "execute",
+                e.getMessage());
         }
     }
 
@@ -200,9 +255,15 @@ public final class SqlExecutor {
             }
         }
 
-        for (String col : columns) {
-            if (col == null || !knownCols.contains(col)) {
-                return "Column " + col + " does not exist on table " + tableName;
+        // Slice 33.1.0b — caller passes ``columns=null`` when this is a
+        // select with no projection list (caller wants ``SELECT *``).
+        // Skip the per-column check; the table existence check above
+        // still runs, and the where_column check below still runs.
+        if (columns != null) {
+            for (String col : columns) {
+                if (col == null || !knownCols.contains(col)) {
+                    return "Column " + col + " does not exist on table " + tableName;
+                }
             }
         }
         if (whereColumn != null && !knownCols.contains(whereColumn)) {
@@ -294,6 +355,22 @@ public final class SqlExecutor {
                 }
                 return "UPDATE \"" + tableName + "\" SET " + set
                     + " WHERE \"" + whereColumn + "\" = ?";
+            }
+            case "select": {
+                // Slice 33.1.0b — projection list comes through ``columns``;
+                // null/empty means SELECT *. ``where_column`` is required
+                // (gated upstream); only one bind value (where_value).
+                StringBuilder proj = new StringBuilder();
+                if (columns == null || columns.isEmpty()) {
+                    proj.append("*");
+                } else {
+                    for (int i = 0; i < columns.size(); i++) {
+                        if (i > 0) proj.append(", ");
+                        proj.append('"').append(columns.get(i)).append('"');
+                    }
+                }
+                return "SELECT " + proj + " FROM \"" + tableName + "\" "
+                    + "WHERE \"" + whereColumn + "\" = ?";
             }
             default:
                 throw new IllegalStateException("buildSql: " + operation);
