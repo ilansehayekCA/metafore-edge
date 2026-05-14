@@ -377,4 +377,289 @@ class SqlExecutorTest {
         assertTrue(exc.getMessage().contains("timestamptz"));
         assertTrue(exc.getMessage().contains("not-an-iso-timestamp"));
     }
+
+    // ── ADR-016 F1.T2b — read patterns (by_id / by_ids / list / count) ──
+    //
+    // The four pattern variants are testable at two layers:
+    //   - buildReadSql: pure string-building, no DB. Exercises the
+    //     SQL template for each pattern + filter combination.
+    //   - executeParametricRead: with a null DataSource, the validation
+    //     gates surface error envelopes deterministically without
+    //     reaching the JDBC layer (mirrors the existing
+    //     executeParametric validation-only tests).
+
+    @Test
+    void buildReadSqlByIdSelectsAllColumnsByDefault() {
+        String sql = SqlExecutor.buildReadSql(
+            "by_id", "patients", java.util.Collections.emptyList(),
+            "record_id", 0, false
+        );
+        assertEquals(
+            "SELECT * FROM \"patients\" WHERE \"record_id\" = ?",
+            sql
+        );
+    }
+
+    @Test
+    void buildReadSqlByIdRespectsProjection() {
+        String sql = SqlExecutor.buildReadSql(
+            "by_id", "patients",
+            java.util.List.of("record_id", "name", "consent_status"),
+            "record_id", 0, false
+        );
+        assertEquals(
+            "SELECT \"record_id\", \"name\", \"consent_status\" "
+            + "FROM \"patients\" WHERE \"record_id\" = ?",
+            sql
+        );
+    }
+
+    @Test
+    void buildReadSqlByIdsRendersInClauseWithCorrectPlaceholderCount() {
+        String sql = SqlExecutor.buildReadSql(
+            "by_ids", "providers",
+            java.util.List.of("record_id", "name"),
+            "record_id", 3, false
+        );
+        assertEquals(
+            "SELECT \"record_id\", \"name\" FROM \"providers\" "
+            + "WHERE \"record_id\" IN (?, ?, ?)",
+            sql
+        );
+    }
+
+    @Test
+    void buildReadSqlByIdsSinglePlaceholderForListOfOne() {
+        // Edge case: filter_values of length 1 should still render IN
+        // (?), not = ?. The dispatch-side pattern choice (by_id vs
+        // by_ids) is the caller's decision.
+        String sql = SqlExecutor.buildReadSql(
+            "by_ids", "t", java.util.Collections.emptyList(),
+            "fc", 1, false
+        );
+        assertEquals(
+            "SELECT * FROM \"t\" WHERE \"fc\" IN (?)",
+            sql
+        );
+    }
+
+    @Test
+    void buildReadSqlListNoFiltersIsBareSelect() {
+        String sql = SqlExecutor.buildReadSql(
+            "list", "patients", java.util.Collections.emptyList(),
+            null, 0, false
+        );
+        assertEquals("SELECT * FROM \"patients\"", sql);
+    }
+
+    @Test
+    void buildReadSqlListExcludeTombstonedOnly() {
+        String sql = SqlExecutor.buildReadSql(
+            "list", "patients", java.util.List.of("record_id", "name"),
+            null, 0, true
+        );
+        assertEquals(
+            "SELECT \"record_id\", \"name\" FROM \"patients\" "
+            + "WHERE \"tombstoned_at\" IS NULL",
+            sql
+        );
+    }
+
+    @Test
+    void buildReadSqlListFilterColumnOnly() {
+        // "interactions for Sarah Chen the provider" — list of
+        // interactions filtered by provider_id.
+        String sql = SqlExecutor.buildReadSql(
+            "list", "interactions", java.util.List.of("record_id", "summary"),
+            "provider_id", 0, false
+        );
+        assertEquals(
+            "SELECT \"record_id\", \"summary\" FROM \"interactions\" "
+            + "WHERE \"provider_id\" = ?",
+            sql
+        );
+    }
+
+    @Test
+    void buildReadSqlListFilterColumnAndExcludeTombstonedCombineWithAnd() {
+        String sql = SqlExecutor.buildReadSql(
+            "list", "interactions",
+            java.util.List.of("record_id"),
+            "provider_id", 0, true
+        );
+        assertEquals(
+            "SELECT \"record_id\" FROM \"interactions\" "
+            + "WHERE \"provider_id\" = ? "
+            + "AND \"tombstoned_at\" IS NULL",
+            sql
+        );
+    }
+
+    @Test
+    void buildReadSqlCountIgnoresProjection() {
+        // count pattern always emits COUNT(*) regardless of caller-
+        // supplied columns.
+        String sql = SqlExecutor.buildReadSql(
+            "count", "patients",
+            java.util.List.of("record_id", "name"),  // ignored
+            null, 0, false
+        );
+        assertEquals(
+            "SELECT COUNT(*) AS count FROM \"patients\"",
+            sql
+        );
+    }
+
+    @Test
+    void buildReadSqlCountWithFilterAndTombstone() {
+        // auto_seq's COUNT(*) for next-id resolution + tombstone-aware
+        // count for "how many active Patients for this Provider".
+        String sql = SqlExecutor.buildReadSql(
+            "count", "interactions", java.util.Collections.emptyList(),
+            "provider_id", 0, true
+        );
+        assertEquals(
+            "SELECT COUNT(*) AS count FROM \"interactions\" "
+            + "WHERE \"provider_id\" = ? "
+            + "AND \"tombstoned_at\" IS NULL",
+            sql
+        );
+    }
+
+    @Test
+    void executeParametricReadRejectsUnknownPattern() {
+        Map<String, Object> payload = new java.util.HashMap<>();
+        payload.put("pattern", "by_record_id");  // typo
+        payload.put("table_name", "patients");
+        Map<String, Object> r = SqlExecutor.executeParametricRead(
+            null, payload);
+        assertEquals("error", r.get("status"));
+        assertTrue(((String) r.get("error")).contains("by_record_id"));
+        assertTrue(((String) r.get("error")).contains(
+            "by_id/by_ids/list/count"));
+    }
+
+    @Test
+    void executeParametricReadRejectsBlankTableName() {
+        Map<String, Object> payload = new java.util.HashMap<>();
+        payload.put("pattern", "by_id");
+        payload.put("table_name", "");
+        Map<String, Object> r = SqlExecutor.executeParametricRead(
+            null, payload);
+        assertEquals("error", r.get("status"));
+        assertTrue(((String) r.get("error")).contains("table_name"));
+    }
+
+    @Test
+    void executeParametricReadRejectsByIdWithoutFilterColumn() {
+        Map<String, Object> payload = new java.util.HashMap<>();
+        payload.put("pattern", "by_id");
+        payload.put("table_name", "patients");
+        payload.put("filter_value", "rec-1");
+        Map<String, Object> r = SqlExecutor.executeParametricRead(
+            null, payload);
+        assertEquals("error", r.get("status"));
+        assertTrue(((String) r.get("error")).contains("filter_column"));
+    }
+
+    @Test
+    void executeParametricReadRejectsByIdWithoutFilterValue() {
+        Map<String, Object> payload = new java.util.HashMap<>();
+        payload.put("pattern", "by_id");
+        payload.put("table_name", "patients");
+        payload.put("filter_column", "record_id");
+        Map<String, Object> r = SqlExecutor.executeParametricRead(
+            null, payload);
+        assertEquals("error", r.get("status"));
+        assertTrue(((String) r.get("error")).contains("filter_value"));
+    }
+
+    @Test
+    void executeParametricReadRejectsByIdsWithoutFilterValues() {
+        Map<String, Object> payload = new java.util.HashMap<>();
+        payload.put("pattern", "by_ids");
+        payload.put("table_name", "patients");
+        payload.put("filter_column", "record_id");
+        Map<String, Object> r = SqlExecutor.executeParametricRead(
+            null, payload);
+        assertEquals("error", r.get("status"));
+        assertTrue(((String) r.get("error")).contains("filter_values"));
+    }
+
+    @Test
+    void executeParametricReadRejectsByIdsWithEmptyList() {
+        Map<String, Object> payload = new java.util.HashMap<>();
+        payload.put("pattern", "by_ids");
+        payload.put("table_name", "patients");
+        payload.put("filter_column", "record_id");
+        payload.put("filter_values", java.util.Collections.emptyList());
+        Map<String, Object> r = SqlExecutor.executeParametricRead(
+            null, payload);
+        assertEquals("error", r.get("status"));
+        assertTrue(((String) r.get("error")).contains("non-empty"));
+    }
+
+    @Test
+    void executeParametricReadRejectsByIdsOversizedList() {
+        // Defensive: cap IN list at MAX_ROWS to keep PreparedStatement
+        // round-trip predictable.
+        Map<String, Object> payload = new java.util.HashMap<>();
+        payload.put("pattern", "by_ids");
+        payload.put("table_name", "patients");
+        payload.put("filter_column", "record_id");
+        java.util.List<String> ids = new java.util.ArrayList<>();
+        for (int i = 0; i < 101; i++) ids.add("rec-" + i);
+        payload.put("filter_values", ids);
+        Map<String, Object> r = SqlExecutor.executeParametricRead(
+            null, payload);
+        assertEquals("error", r.get("status"));
+        assertTrue(((String) r.get("error")).contains("MAX_ROWS"));
+    }
+
+    @Test
+    void executeParametricReadRejectsListFilterColumnWithoutValue() {
+        // list/count: filter_column is optional; if provided,
+        // filter_value is required.
+        Map<String, Object> payload = new java.util.HashMap<>();
+        payload.put("pattern", "list");
+        payload.put("table_name", "interactions");
+        payload.put("filter_column", "provider_id");
+        Map<String, Object> r = SqlExecutor.executeParametricRead(
+            null, payload);
+        assertEquals("error", r.get("status"));
+        assertTrue(((String) r.get("error")).contains("filter_value"));
+    }
+
+    @Test
+    void executeParametricReadRejectsCountFilterColumnWithoutValue() {
+        Map<String, Object> payload = new java.util.HashMap<>();
+        payload.put("pattern", "count");
+        payload.put("table_name", "interactions");
+        payload.put("filter_column", "provider_id");
+        Map<String, Object> r = SqlExecutor.executeParametricRead(
+            null, payload);
+        assertEquals("error", r.get("status"));
+        assertTrue(((String) r.get("error")).contains("filter_value"));
+    }
+
+    @Test
+    void executeParametricReadAcceptsListWithNoFilterAndNoTombstoneExclusion() {
+        // Valid: list pattern with neither filter_column nor
+        // exclude_tombstoned → full-table SELECT. Validation passes;
+        // caller's tradeoff to manage row volume vs MAX_ROWS cap.
+        // (DB-touching execution path can't run without a DataSource,
+        // but the validation gates should clear.)
+        // We verify validation by reaching the JDBC connection step:
+        // a null DataSource produces a NPE-wrapped SQLException AFTER
+        // validation. The error message will mention DataSource, not
+        // any validation field — proving validation passed.
+        Map<String, Object> payload = new java.util.HashMap<>();
+        payload.put("pattern", "list");
+        payload.put("table_name", "patients");
+        // No filter_column, no filter_value, no exclude_tombstoned.
+        // Validation should clear and the call should attempt a DB
+        // connection (failing with a clear error on null ds).
+        assertThrows(NullPointerException.class,
+            () -> SqlExecutor.executeParametricRead(null, payload));
+    }
 }

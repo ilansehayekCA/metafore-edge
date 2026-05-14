@@ -544,6 +544,289 @@ public final class SqlExecutor {
         return r;
     }
 
+    /**
+     * ADR-016 F1.T2b — parametric on-demand record reads through the
+     * Integration's routes.read template.
+     *
+     * Distinct from {@link #executeParametric}'s ``select`` op (Slice
+     * 33.1.0b, single-row by where_column = where_value used for
+     * SELECT-before-UPDATE): the new ``read`` operation supports four
+     * patterns the dispatcher chooses based on the caller's need —
+     * by_id, by_ids (IN clause), list (with optional FK filter +
+     * tombstone exclusion), count (aggregate). All four go through
+     * the same PreparedStatement + INFORMATION_SCHEMA validation +
+     * type-supported gate as the write ops, so the safety surface
+     * stays uniform across CRUD.
+     *
+     * Payload shape:
+     * <pre>
+     * {
+     *   operation:           "read",
+     *   pattern:             "by_id" | "by_ids" | "list" | "count",
+     *   table_name:          STRING,
+     *   columns:             [STRING] | null,      // projection; null/empty = SELECT *
+     *                                              // (ignored for count)
+     *   filter_column:       STRING | null,        // FK or key column
+     *   filter_value:        Object | null,        // for by_id; for list/count with FK
+     *   filter_values:       [Object] | null,      // for by_ids
+     *   exclude_tombstoned:  BOOL                  // AND tombstoned_at IS NULL
+     * }
+     * </pre>
+     *
+     * Pattern → SQL:
+     * <ul>
+     *   <li>by_id   → SELECT cols FROM "t" WHERE "fc" = ?</li>
+     *   <li>by_ids  → SELECT cols FROM "t" WHERE "fc" IN (?,?,…)</li>
+     *   <li>list    → SELECT cols FROM "t" [WHERE "fc"=? [AND]]
+     *                 [tombstoned_at IS NULL]</li>
+     *   <li>count   → SELECT COUNT(*) AS count FROM "t" [WHERE …]</li>
+     * </ul>
+     *
+     * Returns the same envelope as the existing ``select`` op:
+     * <pre>
+     * {status, action: "query", latency_ms, row_count, data: [...]}
+     * </pre>
+     * count pattern returns one row in data: <code>[{count: N}]</code>
+     * with row_count=1.
+     *
+     * Validation order:
+     *  1. Pattern + table_name presence.
+     *  2. Pattern-specific required fields (filter_column / filter_value /
+     *     filter_values).
+     *  3. Table existence + projection column existence (skipped for
+     *     count) + filter_column existence + tombstoned_at column
+     *     existence (when exclude_tombstoned=true).
+     *  4. Runtime type-supported gate on filter values.
+     */
+    @SuppressWarnings("unchecked")
+    public static Map<String, Object> executeParametricRead(
+        DataSource ds, Map<String, Object> payload
+    ) {
+        long start = System.currentTimeMillis();
+
+        if (payload == null) {
+            return errorResult(start, "query", "Missing read payload");
+        }
+        String pattern = (String) payload.get("pattern");
+        String tableName = (String) payload.get("table_name");
+        Object colsObj = payload.get("columns");
+        String filterColumn = (String) payload.get("filter_column");
+        Object filterValue = payload.get("filter_value");
+        Object filterValuesObj = payload.get("filter_values");
+        boolean excludeTombstoned = Boolean.TRUE.equals(
+            payload.get("exclude_tombstoned"));
+
+        if (pattern == null || !Set.of(
+                "by_id", "by_ids", "list", "count").contains(pattern)) {
+            return errorResult(start, "query",
+                "Unsupported read pattern: " + pattern
+                + " (expected by_id/by_ids/list/count)");
+        }
+        if (tableName == null || tableName.isBlank()) {
+            return errorResult(start, "query",
+                "Missing or empty table_name");
+        }
+
+        // Pattern-specific required fields.
+        List<Object> filterValues = null;
+        if ("by_id".equals(pattern)) {
+            if (filterColumn == null || filterColumn.isBlank()) {
+                return errorResult(start, "query",
+                    "by_id pattern requires filter_column");
+            }
+            if (filterValue == null) {
+                return errorResult(start, "query",
+                    "by_id pattern requires filter_value");
+            }
+        } else if ("by_ids".equals(pattern)) {
+            if (filterColumn == null || filterColumn.isBlank()) {
+                return errorResult(start, "query",
+                    "by_ids pattern requires filter_column");
+            }
+            if (!(filterValuesObj instanceof List)) {
+                return errorResult(start, "query",
+                    "by_ids pattern requires filter_values list");
+            }
+            filterValues = new ArrayList<>((List<Object>) filterValuesObj);
+            if (filterValues.isEmpty()) {
+                return errorResult(start, "query",
+                    "by_ids pattern requires non-empty filter_values");
+            }
+            if (filterValues.size() > MAX_ROWS) {
+                return errorResult(start, "query",
+                    "by_ids filter_values exceeds MAX_ROWS=" + MAX_ROWS
+                    + " (size=" + filterValues.size() + ")");
+            }
+        } else {
+            // list / count — filter_column is optional; if present,
+            // filter_value is required.
+            if (filterColumn != null && !filterColumn.isBlank()
+                && filterValue == null) {
+                return errorResult(start, "query",
+                    pattern + " pattern with filter_column requires "
+                    + "filter_value");
+            }
+        }
+
+        // Normalize projection columns. Count ignores projection.
+        List<String> columns;
+        if ("count".equals(pattern)) {
+            columns = java.util.Collections.emptyList();
+        } else if (colsObj instanceof List) {
+            columns = new ArrayList<>();
+            for (Object c : (List<Object>) colsObj) {
+                if (c != null) columns.add(c.toString());
+            }
+        } else {
+            columns = java.util.Collections.emptyList();
+        }
+
+        try (Connection conn = ds.getConnection()) {
+            // Build the validation column list: projection cols
+            // (skipped for count) + tombstoned_at when exclude_tombstoned.
+            List<String> colsToValidate;
+            if ("count".equals(pattern) && !excludeTombstoned) {
+                colsToValidate = null;  // skip per-column check
+            } else {
+                List<String> cv = new ArrayList<>();
+                if (!"count".equals(pattern)) cv.addAll(columns);
+                if (excludeTombstoned) cv.add("tombstoned_at");
+                colsToValidate = cv.isEmpty() ? null : cv;
+            }
+            String validationError = validateTableAndColumns(
+                conn, tableName, colsToValidate, filterColumn);
+            if (validationError != null) {
+                return errorResult(start, "query", validationError);
+            }
+
+            // Type-supported gate on filter values.
+            String typeError;
+            if ("by_ids".equals(pattern)) {
+                typeError = validateValueTypes(filterValues, null);
+            } else if (filterValue != null) {
+                typeError = validateValueTypes(
+                    java.util.Collections.emptyList(), filterValue);
+            } else {
+                typeError = null;
+            }
+            if (typeError != null) {
+                return errorResult(start, "query", typeError);
+            }
+
+            Map<String, String> columnTypes = fetchColumnTypes(
+                conn, tableName);
+
+            String sql = buildReadSql(
+                pattern, tableName, columns, filterColumn,
+                filterValues != null ? filterValues.size() : 0,
+                excludeTombstoned
+            );
+
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                int idx = 1;
+                if ("by_ids".equals(pattern)) {
+                    String fcType = columnTypes.get(filterColumn);
+                    for (Object v : filterValues) {
+                        bindValue(ps, idx++, v, fcType);
+                    }
+                } else if (filterValue != null && filterColumn != null
+                    && !filterColumn.isBlank()) {
+                    String fcType = columnTypes.get(filterColumn);
+                    bindValue(ps, idx, filterValue, fcType);
+                }
+                try (ResultSet rs = ps.executeQuery()) {
+                    ResultSetMetaData meta = rs.getMetaData();
+                    int colCount = meta.getColumnCount();
+                    List<Map<String, Object>> rows = new ArrayList<>();
+                    while (rs.next() && rows.size() < MAX_ROWS) {
+                        Map<String, Object> row = new LinkedHashMap<>();
+                        for (int i = 1; i <= colCount; i++) {
+                            Object val = rs.getObject(i);
+                            row.put(meta.getColumnLabel(i),
+                                val != null ? val.toString() : null);
+                        }
+                        rows.add(row);
+                    }
+                    Map<String, Object> result = new LinkedHashMap<>();
+                    result.put("status", "success");
+                    result.put("action", "query");
+                    result.put("latency_ms",
+                        System.currentTimeMillis() - start);
+                    result.put("row_count", rows.size());
+                    result.put("data", rows);
+                    return result;
+                }
+            }
+        } catch (SQLException e) {
+            return errorResult(start, "query", e.getMessage());
+        }
+    }
+
+    /**
+     * ADR-016 F1.T2b — build the SELECT SQL for a read pattern.
+     * Package-private so the four pattern variants are directly
+     * testable without a Connection.
+     *
+     * Identifier quoting is via "..." matching the write-side
+     * renderers; identifier names are not user-controlled and have
+     * been checked by {@link #validateTableAndColumns} upstream.
+     */
+    static String buildReadSql(
+        String pattern, String tableName, List<String> columns,
+        String filterColumn, int filterValuesCount,
+        boolean excludeTombstoned
+    ) {
+        // Projection.
+        String proj;
+        if ("count".equals(pattern)) {
+            proj = "COUNT(*) AS count";
+        } else if (columns == null || columns.isEmpty()) {
+            proj = "*";
+        } else {
+            StringBuilder pb = new StringBuilder();
+            for (int i = 0; i < columns.size(); i++) {
+                if (i > 0) pb.append(", ");
+                pb.append('"').append(columns.get(i)).append('"');
+            }
+            proj = pb.toString();
+        }
+
+        StringBuilder sql = new StringBuilder("SELECT ");
+        sql.append(proj);
+        sql.append(" FROM \"").append(tableName).append('"');
+
+        // WHERE clauses (combined with AND).
+        List<String> whereClauses = new ArrayList<>();
+        if ("by_id".equals(pattern)) {
+            whereClauses.add("\"" + filterColumn + "\" = ?");
+        } else if ("by_ids".equals(pattern)) {
+            StringBuilder in = new StringBuilder();
+            in.append('"').append(filterColumn).append("\" IN (");
+            for (int i = 0; i < filterValuesCount; i++) {
+                if (i > 0) in.append(", ");
+                in.append('?');
+            }
+            in.append(')');
+            whereClauses.add(in.toString());
+        } else if (("list".equals(pattern) || "count".equals(pattern))
+            && filterColumn != null && !filterColumn.isBlank()) {
+            whereClauses.add("\"" + filterColumn + "\" = ?");
+        }
+        if (excludeTombstoned) {
+            whereClauses.add("\"tombstoned_at\" IS NULL");
+        }
+
+        if (!whereClauses.isEmpty()) {
+            sql.append(" WHERE ");
+            for (int i = 0; i < whereClauses.size(); i++) {
+                if (i > 0) sql.append(" AND ");
+                sql.append(whereClauses.get(i));
+            }
+        }
+
+        return sql.toString();
+    }
+
     public static Map<String, Object> execute(DataSource ds, String sql) {
         Map<String, Object> result = new LinkedHashMap<>();
         long start = System.currentTimeMillis();
