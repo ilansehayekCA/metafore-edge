@@ -159,6 +159,17 @@ public class RouteExecutorRoute extends RouteBuilder {
         }
 
         String operation = (String) params.get("operation");
+
+        // ADR-016 F1.T2b — "read" op has a richer payload shape
+        // (pattern + filter_column + filter_value / filter_values +
+        // exclude_tombstoned) than the write ops or the legacy "select"
+        // op. Delegate to executeRead so the dispatch boundary stays
+        // operation-aware without forcing the write payload shape onto
+        // reads.
+        if ("read".equals(operation)) {
+            return executeRead(routeId, ds, params);
+        }
+
         String tableName = (String) params.get("table_name");
         Object colsObj = params.get("columns");
         Object valsObj = params.get("values");
@@ -195,6 +206,32 @@ public class RouteExecutorRoute extends RouteBuilder {
         String error = (String) execResult.get("error");
         return MessageFactory.routeResult(config, routeId,
             status, action, latency, rowCount, rowsAffected, data, error, null);
+    }
+
+    /**
+     * ADR-016 F1.T2b — dispatch on-demand record reads to
+     * {@link SqlExecutor#executeParametricRead}.
+     *
+     * Payload carries pattern + filter_column + filter_value /
+     * filter_values + exclude_tombstoned alongside the standard
+     * parametric envelope. Result shape mirrors the existing
+     * ``select`` op (data array + row_count).
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> executeRead(
+        String routeId, DataSource ds, Map<String, Object> params
+    ) {
+        Map<String, Object> execResult =
+            SqlExecutor.executeParametricRead(ds, params);
+        String status = (String) execResult.get("status");
+        String action = (String) execResult.getOrDefault("action", "query");
+        long latency = ((Number) execResult.get("latency_ms")).longValue();
+        Integer rowCount = (Integer) execResult.get("row_count");
+        List<Map<String, Object>> data =
+            (List<Map<String, Object>>) execResult.get("data");
+        String error = (String) execResult.get("error");
+        return MessageFactory.routeResult(config, routeId,
+            status, action, latency, rowCount, null, data, error, null);
     }
 
     private Map<String, Object> executeShell(String routeId, String command) {
