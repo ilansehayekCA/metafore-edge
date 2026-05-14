@@ -569,7 +569,18 @@ public final class SqlExecutor {
      *   filter_column:       STRING | null,        // FK or key column
      *   filter_value:        Object | null,        // for by_id; for list/count with FK
      *   filter_values:       [Object] | null,      // for by_ids
-     *   exclude_tombstoned:  BOOL                  // AND tombstoned_at IS NULL
+     *   exclude_tombstoned:  BOOL,                 // AND tombstoned_at IS NULL
+     *
+     *   // Phase 13 / REK.T2a — keyset pagination (list pattern only):
+     *   keyset_field:        STRING | null,        // OPTIONAL — when present, enables keyset mode
+     *   keyset_value:        Object | null,        // OPTIONAL when keyset_field is set; cursor
+     *                                              //   pivot (WHERE "$keyset_field" > ?).
+     *                                              //   null/missing means "start from beginning"
+     *                                              //   (no WHERE clause on the keyset column).
+     *   limit:               INT | null            // REQUIRED when keyset_field is set; page size.
+     *                                              //   Clamped to MAX_ROWS-1 (= 99) to keep the
+     *                                              //   safety net. Edge fetches limit+1 rows
+     *                                              //   internally to derive has_more.
      * }
      * </pre>
      *
@@ -579,6 +590,10 @@ public final class SqlExecutor {
      *   <li>by_ids  → SELECT cols FROM "t" WHERE "fc" IN (?,?,…)</li>
      *   <li>list    → SELECT cols FROM "t" [WHERE "fc"=? [AND]]
      *                 [tombstoned_at IS NULL]</li>
+     *   <li>list (keyset) → SELECT cols FROM "t"
+     *                 [WHERE "$keyset_field" > ?]
+     *                 [AND "fc"=?] [AND "tombstoned_at" IS NULL]
+     *                 ORDER BY "$keyset_field" ASC LIMIT ?</li>
      *   <li>count   → SELECT COUNT(*) AS count FROM "t" [WHERE …]</li>
      * </ul>
      *
@@ -589,14 +604,34 @@ public final class SqlExecutor {
      * count pattern returns one row in data: <code>[{count: N}]</code>
      * with row_count=1.
      *
+     * Keyset mode adds two fields to the success envelope:
+     * <pre>
+     * {..., has_more: BOOL, last_keyset_value: Object | null}
+     * </pre>
+     * ``has_more`` is true iff the internal fetch returned more than
+     * ``limit`` rows (the sentinel +1 row is trimmed before serializing).
+     * ``last_keyset_value`` is the keyset_field value of the last row
+     * returned to the caller (after trimming) when ``has_more`` is true;
+     * null otherwise. Callers use ``last_keyset_value`` as the next
+     * ``keyset_value`` to fetch the next page.
+     *
+     * Backward compatibility: when ``keyset_field`` is absent from the
+     * payload, the SQL emission + envelope is BYTE-FOR-BYTE identical to
+     * the pre-REK.T2a behavior — existing dispatchers see no change.
+     *
      * Validation order:
      *  1. Pattern + table_name presence.
      *  2. Pattern-specific required fields (filter_column / filter_value /
      *     filter_values).
-     *  3. Table existence + projection column existence (skipped for
+     *  3. Keyset-mode preconditions: pattern must be ``list``; ``limit``
+     *     must be present + positive. ``keyset_field`` existence is
+     *     checked alongside the rest of the validation columns in step 4.
+     *  4. Table existence + projection column existence (skipped for
      *     count) + filter_column existence + tombstoned_at column
-     *     existence (when exclude_tombstoned=true).
-     *  4. Runtime type-supported gate on filter values.
+     *     existence (when exclude_tombstoned=true) + keyset_field
+     *     existence (when keyset mode).
+     *  5. Runtime type-supported gate on filter values (and keyset_value
+     *     when present).
      */
     @SuppressWarnings("unchecked")
     public static Map<String, Object> executeParametricRead(
@@ -616,6 +651,13 @@ public final class SqlExecutor {
         boolean excludeTombstoned = Boolean.TRUE.equals(
             payload.get("exclude_tombstoned"));
 
+        // Phase 13 / REK.T2a — keyset pagination fields.
+        // keyset_field absent → behave exactly as pre-REK.T2a (back-compat).
+        String keysetField = (String) payload.get("keyset_field");
+        Object keysetValue = payload.get("keyset_value");
+        Object limitObj = payload.get("limit");
+        boolean keysetMode = keysetField != null && !keysetField.isBlank();
+
         if (pattern == null || !Set.of(
                 "by_id", "by_ids", "list", "count").contains(pattern)) {
             return errorResult(start, "query",
@@ -625,6 +667,36 @@ public final class SqlExecutor {
         if (tableName == null || tableName.isBlank()) {
             return errorResult(start, "query",
                 "Missing or empty table_name");
+        }
+
+        // Keyset-mode preconditions. Keyset semantics are list-only —
+        // ORDER BY + LIMIT on by_id / by_ids / count would either be a
+        // contradiction (by_id returns ≤1) or change scalar semantics
+        // (count). Reject loudly so misuse surfaces at the edge.
+        int effectiveLimit = 0;
+        if (keysetMode) {
+            if (!"list".equals(pattern)) {
+                return errorResult(start, "query",
+                    "keyset_field only supported with pattern=list "
+                    + "(got pattern=" + pattern + ")");
+            }
+            if (limitObj == null) {
+                return errorResult(start, "query",
+                    "keyset_field requires limit");
+            }
+            if (!(limitObj instanceof Number)) {
+                return errorResult(start, "query",
+                    "limit must be a number (got "
+                    + limitObj.getClass().getName() + ")");
+            }
+            int requestedLimit = ((Number) limitObj).intValue();
+            if (requestedLimit <= 0) {
+                return errorResult(start, "query",
+                    "limit must be positive (got " + requestedLimit + ")");
+            }
+            // Clamp at MAX_ROWS-1 so limit+1 cannot exceed MAX_ROWS and
+            // the existing in-loop MAX_ROWS safety net stays intact.
+            effectiveLimit = Math.min(requestedLimit, MAX_ROWS - 1);
         }
 
         // Pattern-specific required fields.
@@ -683,14 +755,16 @@ public final class SqlExecutor {
 
         try (Connection conn = ds.getConnection()) {
             // Build the validation column list: projection cols
-            // (skipped for count) + tombstoned_at when exclude_tombstoned.
+            // (skipped for count) + tombstoned_at when exclude_tombstoned
+            // + keyset_field when in keyset mode.
             List<String> colsToValidate;
-            if ("count".equals(pattern) && !excludeTombstoned) {
+            if ("count".equals(pattern) && !excludeTombstoned && !keysetMode) {
                 colsToValidate = null;  // skip per-column check
             } else {
                 List<String> cv = new ArrayList<>();
                 if (!"count".equals(pattern)) cv.addAll(columns);
                 if (excludeTombstoned) cv.add("tombstoned_at");
+                if (keysetMode) cv.add(keysetField);
                 colsToValidate = cv.isEmpty() ? null : cv;
             }
             String validationError = validateTableAndColumns(
@@ -699,7 +773,7 @@ public final class SqlExecutor {
                 return errorResult(start, "query", validationError);
             }
 
-            // Type-supported gate on filter values.
+            // Type-supported gate on filter values + keyset_value.
             String typeError;
             if ("by_ids".equals(pattern)) {
                 typeError = validateValueTypes(filterValues, null);
@@ -708,6 +782,13 @@ public final class SqlExecutor {
                     java.util.Collections.emptyList(), filterValue);
             } else {
                 typeError = null;
+            }
+            if (typeError == null && keysetMode && keysetValue != null) {
+                // Use the where_value slot (label="where_value") to surface
+                // a clean diagnostic; the JSONB/array rejection set is
+                // the same for keyset_value as for any other bound value.
+                typeError = validateValueTypes(
+                    java.util.Collections.emptyList(), keysetValue);
             }
             if (typeError != null) {
                 return errorResult(start, "query", typeError);
@@ -719,11 +800,20 @@ public final class SqlExecutor {
             String sql = buildReadSql(
                 pattern, tableName, columns, filterColumn,
                 filterValues != null ? filterValues.size() : 0,
-                excludeTombstoned
+                excludeTombstoned,
+                keysetMode ? keysetField : null,
+                keysetMode && keysetValue != null
             );
 
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 int idx = 1;
+                // Bind order MUST match the WHERE-clause emission order in
+                // buildReadSql: keyset comparator first (only when
+                // keyset_value present), then filter values, then LIMIT.
+                if (keysetMode && keysetValue != null) {
+                    String ksType = columnTypes.get(keysetField);
+                    bindValue(ps, idx++, keysetValue, ksType);
+                }
                 if ("by_ids".equals(pattern)) {
                     String fcType = columnTypes.get(filterColumn);
                     for (Object v : filterValues) {
@@ -732,16 +822,46 @@ public final class SqlExecutor {
                 } else if (filterValue != null && filterColumn != null
                     && !filterColumn.isBlank()) {
                     String fcType = columnTypes.get(filterColumn);
-                    bindValue(ps, idx, filterValue, fcType);
+                    bindValue(ps, idx++, filterValue, fcType);
+                }
+                if (keysetMode) {
+                    // LIMIT placeholder gets limit+1 to derive has_more.
+                    ps.setInt(idx++, effectiveLimit + 1);
                 }
                 try (ResultSet rs = ps.executeQuery()) {
                     ResultSetMetaData meta = rs.getMetaData();
                     int colCount = meta.getColumnCount();
+                    // Identify which projection index corresponds to
+                    // keyset_field so we can pull last_keyset_value
+                    // without re-fetching. -1 means not in projection
+                    // (caller asked for cols that don't include it);
+                    // we still trim correctly but cannot surface
+                    // last_keyset_value — caller should include
+                    // keyset_field in projection in that case.
+                    int keysetColIdx = -1;
+                    if (keysetMode) {
+                        for (int i = 1; i <= colCount; i++) {
+                            if (keysetField.equals(meta.getColumnLabel(i))) {
+                                keysetColIdx = i;
+                                break;
+                            }
+                        }
+                    }
                     List<Map<String, Object>> rows = new ArrayList<>();
-                    while (rs.next() && rows.size() < MAX_ROWS) {
+                    // Pre-keyset cap (MAX_ROWS) is unchanged. Keyset mode
+                    // caps at effectiveLimit+1 (which is <= MAX_ROWS by
+                    // construction), so the same MAX_ROWS check is a no-op
+                    // for keyset reads but stays a defensive ceiling.
+                    int fetchCap = keysetMode
+                        ? effectiveLimit + 1 : MAX_ROWS;
+                    Object lastKeysetValueRaw = null;
+                    while (rs.next() && rows.size() < fetchCap) {
                         Map<String, Object> row = new LinkedHashMap<>();
                         for (int i = 1; i <= colCount; i++) {
                             Object val = rs.getObject(i);
+                            if (keysetMode && i == keysetColIdx) {
+                                lastKeysetValueRaw = val;
+                            }
                             row.put(meta.getColumnLabel(i),
                                 val != null ? val.toString() : null);
                         }
@@ -752,8 +872,31 @@ public final class SqlExecutor {
                     result.put("action", "query");
                     result.put("latency_ms",
                         System.currentTimeMillis() - start);
-                    result.put("row_count", rows.size());
-                    result.put("data", rows);
+                    if (keysetMode) {
+                        boolean hasMore = rows.size() > effectiveLimit;
+                        if (hasMore) {
+                            // Trim the +1 sentinel so callers always
+                            // see exactly limit rows.
+                            rows = rows.subList(0, effectiveLimit);
+                        }
+                        // last_keyset_value: keyset_field value of the
+                        // last row IN THE TRIMMED PAGE when has_more is
+                        // true (so the caller can paginate forward).
+                        // Null when has_more=false (no next page).
+                        Object lastKv = null;
+                        if (hasMore && !rows.isEmpty() && keysetColIdx > 0) {
+                            Object lastVal = rows.get(rows.size() - 1)
+                                .get(keysetField);
+                            lastKv = lastVal;
+                        }
+                        result.put("row_count", rows.size());
+                        result.put("data", rows);
+                        result.put("has_more", hasMore);
+                        result.put("last_keyset_value", lastKv);
+                    } else {
+                        result.put("row_count", rows.size());
+                        result.put("data", rows);
+                    }
                     return result;
                 }
             }
@@ -770,12 +913,58 @@ public final class SqlExecutor {
      * Identifier quoting is via "..." matching the write-side
      * renderers; identifier names are not user-controlled and have
      * been checked by {@link #validateTableAndColumns} upstream.
+     *
+     * Legacy 6-arg overload — preserved BYTE-FOR-BYTE for backwards
+     * compatibility with the existing test suite and any direct
+     * callers. Delegates to the 8-arg keyset-aware overload with
+     * keyset_field=null (which short-circuits the keyset emission
+     * branches so the output is identical to today's).
      */
     static String buildReadSql(
         String pattern, String tableName, List<String> columns,
         String filterColumn, int filterValuesCount,
         boolean excludeTombstoned
     ) {
+        return buildReadSql(
+            pattern, tableName, columns, filterColumn, filterValuesCount,
+            excludeTombstoned, null, false
+        );
+    }
+
+    /**
+     * Phase 13 / REK.T2a — build the SELECT SQL for a read pattern with
+     * optional keyset pagination semantics.
+     *
+     * When ``keysetField`` is null, the emitted SQL is BYTE-FOR-BYTE
+     * IDENTICAL to the pre-REK.T2a overload's output. Existing
+     * dispatchers see no change.
+     *
+     * When ``keysetField`` is non-null AND ``keysetValuePresent`` is
+     * true, the WHERE clause gains ``"$keysetField" > ?`` as the
+     * FIRST predicate (so binds line up: keyset comparator first,
+     * then any filter binds, then the LIMIT bind). When
+     * ``keysetValuePresent`` is false (first-page fetch with no
+     * cursor pivot), the comparator is omitted but ORDER BY + LIMIT
+     * are still emitted.
+     *
+     * Keyset semantics imply ``ORDER BY "$keysetField" ASC LIMIT ?``
+     * appended after the WHERE block. The LIMIT placeholder is bound
+     * to ``effectiveLimit + 1`` by the caller (sentinel row for
+     * has_more derivation).
+     *
+     * Keyset semantics are LIST-ONLY — the caller is expected to
+     * reject keyset for by_id / by_ids / count upstream. This builder
+     * does not double-check; if a caller misuses it, the emitted SQL
+     * is wrong but no injection or column-existence violation occurs.
+     */
+    static String buildReadSql(
+        String pattern, String tableName, List<String> columns,
+        String filterColumn, int filterValuesCount,
+        boolean excludeTombstoned,
+        String keysetField, boolean keysetValuePresent
+    ) {
+        boolean keysetMode = keysetField != null && !keysetField.isBlank();
+
         // Projection.
         String proj;
         if ("count".equals(pattern)) {
@@ -796,7 +985,12 @@ public final class SqlExecutor {
         sql.append(" FROM \"").append(tableName).append('"');
 
         // WHERE clauses (combined with AND).
+        // Keyset comparator is emitted FIRST so its bind index is 1
+        // (matching executeParametricRead's bind order).
         List<String> whereClauses = new ArrayList<>();
+        if (keysetMode && keysetValuePresent) {
+            whereClauses.add("\"" + keysetField + "\" > ?");
+        }
         if ("by_id".equals(pattern)) {
             whereClauses.add("\"" + filterColumn + "\" = ?");
         } else if ("by_ids".equals(pattern)) {
@@ -822,6 +1016,12 @@ public final class SqlExecutor {
                 if (i > 0) sql.append(" AND ");
                 sql.append(whereClauses.get(i));
             }
+        }
+
+        // Phase 13 / REK.T2a — ORDER BY + LIMIT for keyset mode.
+        if (keysetMode) {
+            sql.append(" ORDER BY \"").append(keysetField)
+               .append("\" ASC LIMIT ?");
         }
 
         return sql.toString();
