@@ -1042,4 +1042,222 @@ class SqlExecutorTest {
         assertTrue(sql.contains("\"record_id\""),
             "keyset_field interpolates as quoted identifier; got: " + sql);
     }
+
+    // ── Phase 14.6 / A6 — schema-qualified table names ──────────────
+    //
+    // Acceptance cases from BRIEF_PHASE_14_6 §A6:
+    //   - parse "frm.products" → schema=frm, table=products
+    //   - parse "patients" → schema=public (default), table=patients
+    //   - reject "a.b.c" (multi-dot ambiguity)
+    //   - reject "" / null / whitespace
+    //   - reject ".products" / "frm." (empty component)
+    //   - buildSql + buildReadSql render "schema"."table" only when
+    //     the schema was explicit (back-compat for bare unqualified).
+    //   - validateTableAndColumns + fetchColumnTypes bind parsed
+    //     schema in INFORMATION_SCHEMA queries.
+
+    @Test
+    void parseTableNameBareIsPublicSchema() {
+        SqlExecutor.ParsedTableName p =
+            SqlExecutor.parseTableName("patients");
+        assertEquals("public", p.schema);
+        assertEquals("patients", p.table);
+        assertFalse(p.schemaWasExplicit,
+            "bare table_name must not be marked explicit");
+        // display() echoes the caller's bare form, not "public.patients"
+        assertEquals("patients", p.display());
+    }
+
+    @Test
+    void parseTableNameSchemaQualified() {
+        SqlExecutor.ParsedTableName p =
+            SqlExecutor.parseTableName("frm.products");
+        assertEquals("frm", p.schema);
+        assertEquals("products", p.table);
+        assertTrue(p.schemaWasExplicit);
+        assertEquals("frm.products", p.display());
+    }
+
+    @Test
+    void parseTableNameTrimsWhitespace() {
+        SqlExecutor.ParsedTableName p =
+            SqlExecutor.parseTableName("  frm.products  ");
+        assertEquals("frm", p.schema);
+        assertEquals("products", p.table);
+        assertTrue(p.schemaWasExplicit);
+    }
+
+    @Test
+    void parseTableNameRejectsMultiDot() {
+        IllegalArgumentException e = assertThrows(
+            IllegalArgumentException.class,
+            () -> SqlExecutor.parseTableName("db.schema.table"));
+        assertTrue(e.getMessage().contains("multiple dots"));
+        assertTrue(e.getMessage().contains("db.schema.table"));
+    }
+
+    @Test
+    void parseTableNameRejectsBlank() {
+        assertThrows(IllegalArgumentException.class,
+            () -> SqlExecutor.parseTableName(""));
+        assertThrows(IllegalArgumentException.class,
+            () -> SqlExecutor.parseTableName("   "));
+        assertThrows(IllegalArgumentException.class,
+            () -> SqlExecutor.parseTableName(null));
+    }
+
+    @Test
+    void parseTableNameRejectsEmptySchemaComponent() {
+        IllegalArgumentException e = assertThrows(
+            IllegalArgumentException.class,
+            () -> SqlExecutor.parseTableName(".products"));
+        assertTrue(e.getMessage().contains("schema"));
+    }
+
+    @Test
+    void parseTableNameRejectsEmptyTableComponent() {
+        IllegalArgumentException e = assertThrows(
+            IllegalArgumentException.class,
+            () -> SqlExecutor.parseTableName("frm."));
+        assertTrue(e.getMessage().contains("table"));
+    }
+
+    // ── buildSql / buildReadSql back-compat: bare names render bare ──
+
+    @Test
+    void buildSqlBareTableRendersBare() {
+        // Existing managed_pg callers pass bare ``patients``; SQL
+        // emission must be byte-for-byte identical to pre-14.6 so
+        // dispatcher payloads + corpus tests stay unchanged.
+        String sql = SqlExecutor.buildSql(
+            "create", "patients",
+            java.util.List.of("name"), null
+        );
+        assertEquals("INSERT INTO \"patients\" (\"name\") VALUES (?)", sql);
+    }
+
+    @Test
+    void buildSqlQualifiedTableRendersQualified() {
+        // External-source mount (e.g. frm.products) passes the
+        // schema-qualified form; SQL emission uses JDBC-correct
+        // ``"schema"."table"``.
+        String sql = SqlExecutor.buildSql(
+            "select", "frm.products",
+            java.util.List.of("product_id", "generic_name"),
+            "product_id"
+        );
+        assertEquals(
+            "SELECT \"product_id\", \"generic_name\" "
+            + "FROM \"frm\".\"products\" "
+            + "WHERE \"product_id\" = ?",
+            sql
+        );
+    }
+
+    @Test
+    void buildSqlUpdateQualifiedTable() {
+        String sql = SqlExecutor.buildSql(
+            "update", "frm.products",
+            java.util.List.of("name"), "product_id"
+        );
+        assertEquals(
+            "UPDATE \"frm\".\"products\" SET \"name\" = ? "
+            + "WHERE \"product_id\" = ?",
+            sql
+        );
+    }
+
+    @Test
+    void buildReadSqlQualifiedListPattern() {
+        String sql = SqlExecutor.buildReadSql(
+            "list", "frm.products",
+            java.util.List.of("product_id", "generic_name"),
+            null, 0, false
+        );
+        assertEquals(
+            "SELECT \"product_id\", \"generic_name\" "
+            + "FROM \"frm\".\"products\"",
+            sql
+        );
+    }
+
+    @Test
+    void buildReadSqlQualifiedByIdPattern() {
+        String sql = SqlExecutor.buildReadSql(
+            "by_id", "pharma.therapy",
+            java.util.List.of("id", "name"),
+            "id", 0, false
+        );
+        assertEquals(
+            "SELECT \"id\", \"name\" FROM \"pharma\".\"therapy\" "
+            + "WHERE \"id\" = ?",
+            sql
+        );
+    }
+
+    @Test
+    void buildReadSqlQualifiedCountPattern() {
+        String sql = SqlExecutor.buildReadSql(
+            "count", "frm.products",
+            java.util.Collections.emptyList(),
+            null, 0, false
+        );
+        assertEquals(
+            "SELECT COUNT(*) AS count FROM \"frm\".\"products\"",
+            sql
+        );
+    }
+
+    @Test
+    void buildReadSqlQualifiedKeysetMode() {
+        String sql = SqlExecutor.buildReadSql(
+            "list", "frm.products",
+            java.util.List.of("product_id", "generic_name"),
+            null, 0, false,
+            "product_id", true
+        );
+        // Must include qualified FROM + keyset comparator + ORDER BY
+        // + LIMIT clauses.
+        assertTrue(sql.contains("FROM \"frm\".\"products\""),
+            "qualified FROM clause; got: " + sql);
+        assertTrue(sql.contains("\"product_id\" > ?"),
+            "keyset comparator; got: " + sql);
+        assertTrue(sql.contains("ORDER BY \"product_id\" ASC LIMIT ?"),
+            "keyset order+limit; got: " + sql);
+    }
+
+    @Test
+    void executeParametricRejectsMultiDotTableName() {
+        Map<String, Object> r = SqlExecutor.executeParametric(
+            null, "create", "db.schema.products",
+            java.util.List.of("name"), java.util.List.of("X"),
+            null, null
+        );
+        assertEquals("error", r.get("status"));
+        assertTrue(((String) r.get("error")).contains("multiple dots"));
+    }
+
+    @Test
+    void executeParametricReadRejectsMultiDotTableName() {
+        Map<String, Object> payload = new java.util.HashMap<>();
+        payload.put("pattern", "list");
+        payload.put("table_name", "db.schema.products");
+        Map<String, Object> r = SqlExecutor.executeParametricRead(
+            null, payload);
+        assertEquals("error", r.get("status"));
+        assertTrue(((String) r.get("error")).contains("multiple dots"));
+    }
+
+    @Test
+    void parsedTableNameDisplayEchoesCallerForm() {
+        // Error messages must echo the caller's input. Operator who
+        // passed "patients" sees "Table patients does not exist", not
+        // "Table public.patients does not exist".
+        SqlExecutor.ParsedTableName bare =
+            SqlExecutor.parseTableName("patients");
+        SqlExecutor.ParsedTableName qualified =
+            SqlExecutor.parseTableName("frm.products");
+        assertEquals("patients", bare.display());
+        assertEquals("frm.products", qualified.display());
+    }
 }

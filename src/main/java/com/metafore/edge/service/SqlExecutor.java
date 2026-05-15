@@ -45,7 +45,122 @@ public final class SqlExecutor {
 
     private static final int MAX_ROWS = 100;
 
+    /** Phase 14.6 / A6 — default schema when ``table_name`` is bare
+     *  (unqualified). Matches PG's behaviour for queries without an
+     *  explicit ``search_path`` override. */
+    static final String DEFAULT_SCHEMA = "public";
+
     private SqlExecutor() {}
+
+    /**
+     * Phase 14.6 / A6 — parsed ``schema.table`` identifier pair.
+     *
+     * Edge SQL builders historically hardcoded ``table_schema='public'``
+     * which broke any external source not living in ``public`` (e.g.
+     * the laptop pharma database that hosts ``frm.products``). This
+     * record carries the two components from
+     * {@link #parseTableName(String)} into the validators + SQL
+     * builders so the JDBC-correct ``"schema"."table"`` form is
+     * emitted at every call site.
+     *
+     * Note: parsed schema and table are NOT user-controlled at the
+     * SQL-render stage; they pass through {@link #parseTableName}
+     * which constrains the format (single dot only) AND through
+     * {@link #validateTableAndColumns} which confirms existence in
+     * INFORMATION_SCHEMA before any SQL hits the database.
+     */
+    static final class ParsedTableName {
+        final String schema;
+        final String table;
+
+        ParsedTableName(String schema, String table) {
+            this.schema = schema;
+            this.table = table;
+        }
+
+        /** Human-readable form for error messages — preserves caller's
+         *  ``schema.table`` formatting when explicit, otherwise the
+         *  bare table name. */
+        String display() {
+            return DEFAULT_SCHEMA.equals(schema) && !schemaWasExplicit
+                ? table : schema + "." + table;
+        }
+
+        /** Tracks whether the caller passed an explicit ``schema.table``
+         *  (true) vs a bare ``table`` (false). Used purely by
+         *  {@link #display()} so error messages echo the caller's
+         *  input shape (avoids surprising the operator who passed
+         *  ``patients`` with "Table public.patients does not exist"). */
+        boolean schemaWasExplicit;
+    }
+
+    /**
+     * Phase 14.6 / A6 — split ``table_name`` into ``(schema, table)``.
+     *
+     * Accepts:
+     * <ul>
+     *   <li>``patients`` → (public, patients) [legacy bare form]</li>
+     *   <li>``frm.products`` → (frm, products) [schema-qualified]</li>
+     * </ul>
+     *
+     * Rejects (throws {@link IllegalArgumentException}):
+     * <ul>
+     *   <li>multi-dot ``a.b.c`` — ambiguous; PG allows
+     *       ``db.schema.table`` but edge has one DB per
+     *       DataSource so the form is unsupported</li>
+     *   <li>empty schema / table component (``.products``,
+     *       ``frm.``)</li>
+     *   <li>blank or null input — caller's job to gate, but
+     *       defensive here too</li>
+     * </ul>
+     *
+     * Identifier-character validation is intentionally NOT done here —
+     * INFORMATION_SCHEMA lookups in
+     * {@link #validateTableAndColumns(Connection, ParsedTableName, List, String)}
+     * confirm the parsed names refer to a real table before any SQL
+     * builder emits them. Identifier quoting via ``"..."`` in
+     * {@link #buildSql} / {@link #buildReadSql} is sufficient at the
+     * render layer.
+     */
+    static ParsedTableName parseTableName(String tableName) {
+        if (tableName == null) {
+            throw new IllegalArgumentException(
+                "table_name cannot be null");
+        }
+        String trimmed = tableName.trim();
+        if (trimmed.isEmpty()) {
+            throw new IllegalArgumentException(
+                "table_name cannot be blank");
+        }
+        int firstDot = trimmed.indexOf('.');
+        if (firstDot < 0) {
+            ParsedTableName p = new ParsedTableName(
+                DEFAULT_SCHEMA, trimmed);
+            p.schemaWasExplicit = false;
+            return p;
+        }
+        int lastDot = trimmed.lastIndexOf('.');
+        if (firstDot != lastDot) {
+            throw new IllegalArgumentException(
+                "table_name has multiple dots — only schema.table form "
+                + "is supported (got '" + tableName + "')");
+        }
+        String schema = trimmed.substring(0, firstDot).trim();
+        String table = trimmed.substring(firstDot + 1).trim();
+        if (schema.isEmpty()) {
+            throw new IllegalArgumentException(
+                "table_name schema component is empty (got '"
+                + tableName + "')");
+        }
+        if (table.isEmpty()) {
+            throw new IllegalArgumentException(
+                "table_name table component is empty (got '"
+                + tableName + "')");
+        }
+        ParsedTableName p = new ParsedTableName(schema, table);
+        p.schemaWasExplicit = true;
+        return p;
+    }
 
     public static boolean isAllowed(String sql) {
         if (sql == null || sql.isBlank()) return false;
@@ -116,6 +231,16 @@ public final class SqlExecutor {
                 "Missing or empty table_name");
         }
 
+        // Phase 14.6 / A6 — parse ``schema.table`` once and reuse the
+        // pair across validator + type-fetch + SQL builder so error
+        // messages and INFORMATION_SCHEMA binds stay consistent.
+        ParsedTableName parsedTable;
+        try {
+            parsedTable = parseTableName(tableName);
+        } catch (IllegalArgumentException e) {
+            return errorResult(start, "execute", e.getMessage());
+        }
+
         // Slice 33.1.0b — ``select`` shape differs from write ops.
         // ``columns`` (when non-empty) is the projection list, NOT bind
         // values; ``values`` is unused. The columns/values length-match
@@ -149,7 +274,7 @@ public final class SqlExecutor {
             List<String> colsToValidate = isSelect && (columns == null
                 || columns.isEmpty()) ? null : columns;
             String validationError = validateTableAndColumns(
-                conn, tableName, colsToValidate, whereColumn);
+                conn, parsedTable, colsToValidate, whereColumn);
             if (validationError != null) {
                 return errorResult(start, "execute", validationError);
             }
@@ -171,9 +296,10 @@ public final class SqlExecutor {
             // bindValue can route timestamp / date columns through
             // setTimestamp / setDate (PG refuses implicit varchar->
             // timestamptz cast on parameter bindings).
-            Map<String, String> columnTypes = fetchColumnTypes(conn, tableName);
+            Map<String, String> columnTypes = fetchColumnTypes(
+                conn, parsedTable);
 
-            String sql = buildSql(operation, tableName, columns, whereColumn);
+            String sql = buildSql(operation, parsedTable, columns, whereColumn);
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 int idx = 1;
                 if (!isSelect) {
@@ -252,12 +378,23 @@ public final class SqlExecutor {
     static Map<String, String> fetchColumnTypes(
         Connection conn, String tableName
     ) throws SQLException {
+        return fetchColumnTypes(conn, parseTableName(tableName));
+    }
+
+    /** Phase 14.6 / A6 — schema-aware overload. Existing single-arg
+     *  callers route through {@link #parseTableName} so legacy bare
+     *  ``patients`` keeps resolving to ``public.patients`` while
+     *  ``frm.products`` resolves to the correct external schema. */
+    static Map<String, String> fetchColumnTypes(
+        Connection conn, ParsedTableName parsed
+    ) throws SQLException {
         Map<String, String> types = new HashMap<>();
         try (PreparedStatement ps = conn.prepareStatement(
             "SELECT column_name, data_type FROM information_schema.columns "
-            + "WHERE table_schema='public' AND table_name=?"
+            + "WHERE table_schema=? AND table_name=?"
         )) {
-            ps.setString(1, tableName);
+            ps.setString(1, parsed.schema);
+            ps.setString(2, parsed.table);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     types.put(rs.getString(1), rs.getString(2));
@@ -273,16 +410,39 @@ public final class SqlExecutor {
         List<String> columns,
         String whereColumn
     ) throws SQLException {
+        ParsedTableName parsed;
+        try {
+            parsed = parseTableName(tableName);
+        } catch (IllegalArgumentException e) {
+            return e.getMessage();
+        }
+        return validateTableAndColumns(conn, parsed, columns, whereColumn);
+    }
+
+    /** Phase 14.6 / A6 — schema-aware overload. The
+     *  INFORMATION_SCHEMA lookups now bind both
+     *  ``table_schema`` and ``table_name`` from the parsed components
+     *  so external sources in non-``public`` schemas pass existence
+     *  checks. Error messages echo the caller's original form (e.g.
+     *  ``Table frm.products does not exist``) via
+     *  {@link ParsedTableName#display()}. */
+    static String validateTableAndColumns(
+        Connection conn,
+        ParsedTableName parsed,
+        List<String> columns,
+        String whereColumn
+    ) throws SQLException {
         // 1. Table existence — distinct error so "table missing" doesn't
         //    masquerade as "every column missing".
         try (PreparedStatement ps = conn.prepareStatement(
             "SELECT 1 FROM information_schema.tables "
-            + "WHERE table_schema='public' AND table_name=?"
+            + "WHERE table_schema=? AND table_name=?"
         )) {
-            ps.setString(1, tableName);
+            ps.setString(1, parsed.schema);
+            ps.setString(2, parsed.table);
             try (ResultSet rs = ps.executeQuery()) {
                 if (!rs.next()) {
-                    return "Table " + tableName + " does not exist";
+                    return "Table " + parsed.display() + " does not exist";
                 }
             }
         }
@@ -291,9 +451,10 @@ public final class SqlExecutor {
         Set<String> knownCols = new HashSet<>();
         try (PreparedStatement ps = conn.prepareStatement(
             "SELECT column_name FROM information_schema.columns "
-            + "WHERE table_schema='public' AND table_name=?"
+            + "WHERE table_schema=? AND table_name=?"
         )) {
-            ps.setString(1, tableName);
+            ps.setString(1, parsed.schema);
+            ps.setString(2, parsed.table);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     knownCols.add(rs.getString(1));
@@ -308,13 +469,14 @@ public final class SqlExecutor {
         if (columns != null) {
             for (String col : columns) {
                 if (col == null || !knownCols.contains(col)) {
-                    return "Column " + col + " does not exist on table " + tableName;
+                    return "Column " + col + " does not exist on table "
+                        + parsed.display();
                 }
             }
         }
         if (whereColumn != null && !knownCols.contains(whereColumn)) {
             return "Column " + whereColumn
-                + " does not exist on table " + tableName;
+                + " does not exist on table " + parsed.display();
         }
         return null;
     }
@@ -354,17 +516,53 @@ public final class SqlExecutor {
             + ". Supported set: " + String.join(", ", SUPPORTED_PG_COLUMN_TYPES);
     }
 
-    private static String buildSql(
+    /** Phase 14.6 / A6 — render the JDBC-correct identifier for a
+     *  table. When the caller passed an explicit ``schema.table``
+     *  (e.g. ``frm.products``), emit ``"schema"."table"``. When the
+     *  caller passed a bare ``table`` (e.g. ``patients`` — the
+     *  pre-14.6 default), emit just ``"table"`` to preserve byte-for-
+     *  byte SQL output for existing managed_pg dispatch sites.
+     *
+     *  Either form is JDBC-valid; PG resolves the unqualified form via
+     *  the connection's ``search_path`` (which defaults to
+     *  ``"$user", public``). The managed AC sessions always live in
+     *  the default search_path, so the legacy bare emission keeps
+     *  finding ``public.patients`` exactly as before. */
+    static String renderQualifiedTable(ParsedTableName parsed) {
+        if (parsed.schemaWasExplicit) {
+            return "\"" + parsed.schema + "\".\"" + parsed.table + "\"";
+        }
+        return "\"" + parsed.table + "\"";
+    }
+
+    static String buildSql(
         String operation,
         String tableName,
         List<String> columns,
         String whereColumn
     ) {
-        // Identifier quoting via "..." matches the existing renderer's
-        // pattern (see metafore-core integration_dispatcher.py renders).
-        // Column names came through validateTableAndColumns and are
-        // confirmed to exist; identifiers are not user-controlled at
-        // this point so quoting + identifier whitelist is sufficient.
+        return buildSql(operation, parseTableName(tableName),
+            columns, whereColumn);
+    }
+
+    /**
+     * Phase 14.6 / A6 — schema-aware overload.
+     *
+     * Identifier quoting via ``"schema"."table"`` matches the JDBC /
+     * PG convention for qualified table names. Column names came
+     * through validateTableAndColumns and are confirmed to exist;
+     * identifiers are not user-controlled at this point so the
+     * combination of explicit ``"..."`` quoting + INFORMATION_SCHEMA
+     * existence-check is the same safety surface the unqualified
+     * legacy path always relied on.
+     */
+    static String buildSql(
+        String operation,
+        ParsedTableName parsed,
+        List<String> columns,
+        String whereColumn
+    ) {
+        String qualifiedTable = renderQualifiedTable(parsed);
         switch (operation) {
             case "create": {
                 StringBuilder cols = new StringBuilder();
@@ -377,7 +575,7 @@ public final class SqlExecutor {
                     cols.append('"').append(columns.get(i)).append('"');
                     qs.append('?');
                 }
-                return "INSERT INTO \"" + tableName + "\" ("
+                return "INSERT INTO " + qualifiedTable + " ("
                     + cols + ") VALUES (" + qs + ")";
             }
             case "update": {
@@ -386,7 +584,7 @@ public final class SqlExecutor {
                     if (i > 0) set.append(", ");
                     set.append('"').append(columns.get(i)).append("\" = ?");
                 }
-                return "UPDATE \"" + tableName + "\" SET " + set
+                return "UPDATE " + qualifiedTable + " SET " + set
                     + " WHERE \"" + whereColumn + "\" = ?";
             }
             case "delete": {
@@ -399,7 +597,7 @@ public final class SqlExecutor {
                     if (i > 0) set.append(", ");
                     set.append('"').append(columns.get(i)).append("\" = ?");
                 }
-                return "UPDATE \"" + tableName + "\" SET " + set
+                return "UPDATE " + qualifiedTable + " SET " + set
                     + " WHERE \"" + whereColumn + "\" = ?";
             }
             case "select": {
@@ -415,7 +613,7 @@ public final class SqlExecutor {
                         proj.append('"').append(columns.get(i)).append('"');
                     }
                 }
-                return "SELECT " + proj + " FROM \"" + tableName + "\" "
+                return "SELECT " + proj + " FROM " + qualifiedTable + " "
                     + "WHERE \"" + whereColumn + "\" = ?";
             }
             default:
@@ -669,6 +867,14 @@ public final class SqlExecutor {
                 "Missing or empty table_name");
         }
 
+        // Phase 14.6 / A6 — parse once for the read path too.
+        ParsedTableName parsedTable;
+        try {
+            parsedTable = parseTableName(tableName);
+        } catch (IllegalArgumentException e) {
+            return errorResult(start, "query", e.getMessage());
+        }
+
         // Keyset-mode preconditions. Keyset semantics are list-only —
         // ORDER BY + LIMIT on by_id / by_ids / count would either be a
         // contradiction (by_id returns ≤1) or change scalar semantics
@@ -768,7 +974,7 @@ public final class SqlExecutor {
                 colsToValidate = cv.isEmpty() ? null : cv;
             }
             String validationError = validateTableAndColumns(
-                conn, tableName, colsToValidate, filterColumn);
+                conn, parsedTable, colsToValidate, filterColumn);
             if (validationError != null) {
                 return errorResult(start, "query", validationError);
             }
@@ -795,10 +1001,10 @@ public final class SqlExecutor {
             }
 
             Map<String, String> columnTypes = fetchColumnTypes(
-                conn, tableName);
+                conn, parsedTable);
 
             String sql = buildReadSql(
-                pattern, tableName, columns, filterColumn,
+                pattern, parsedTable, columns, filterColumn,
                 filterValues != null ? filterValues.size() : 0,
                 excludeTombstoned,
                 keysetMode ? keysetField : null,
@@ -963,6 +1169,23 @@ public final class SqlExecutor {
         boolean excludeTombstoned,
         String keysetField, boolean keysetValuePresent
     ) {
+        return buildReadSql(pattern, parseTableName(tableName), columns,
+            filterColumn, filterValuesCount, excludeTombstoned,
+            keysetField, keysetValuePresent);
+    }
+
+    /**
+     * Phase 14.6 / A6 — schema-aware read-SQL builder. Renders the
+     * ``FROM`` clause as ``"schema"."table"`` so external sources in
+     * non-``public`` schemas can be read. Delegated to from the
+     * legacy String-tableName overload via {@link #parseTableName}.
+     */
+    static String buildReadSql(
+        String pattern, ParsedTableName parsed, List<String> columns,
+        String filterColumn, int filterValuesCount,
+        boolean excludeTombstoned,
+        String keysetField, boolean keysetValuePresent
+    ) {
         boolean keysetMode = keysetField != null && !keysetField.isBlank();
 
         // Projection.
@@ -982,7 +1205,7 @@ public final class SqlExecutor {
 
         StringBuilder sql = new StringBuilder("SELECT ");
         sql.append(proj);
-        sql.append(" FROM \"").append(tableName).append('"');
+        sql.append(" FROM ").append(renderQualifiedTable(parsed));
 
         // WHERE clauses (combined with AND).
         // Keyset comparator is emitted FIRST so its bind index is 1
