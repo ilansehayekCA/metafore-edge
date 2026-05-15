@@ -29,9 +29,12 @@ public class AccessController {
         // Register default DataSource if DB is available
         if (!config.dbHost().isEmpty()) {
             try {
+                // Phase 13 / REK.T6 — explicit defaultRowFetchSize from
+                // EdgeConfig (overridable via DEFAULT_ROW_FETCH_SIZE env).
                 dsRegistry.register("default",
                     config.dbHost(), config.dbPort(), config.dbName(),
-                    config.dbUser(), config.dbPass());
+                    config.dbUser(), config.dbPass(),
+                    config.defaultRowFetchSize());
                 LOG.info("Default DataSource registered");
             } catch (Exception e) {
                 LOG.info("No local database available (OK for gateway mode)");

@@ -16,6 +16,17 @@ public final class EdgeConfig {
     private final String logSource;
     private final long heartbeatIntervalMs;
     private final long discoveryDelayMs;
+    private final int defaultRowFetchSize;
+
+    /**
+     * Phase 13 / REK.T6 — default JDBC row fetch size for PG-backed
+     * DataSources. Acts as a safety net against unbounded SELECTs:
+     * Postgres streams rows in {@code defaultRowFetchSize}-row chunks
+     * so the JVM materializes one chunk at a time. Brief 10's keyset
+     * pagination + LIMIT N+1 remains the primary mechanism; this is
+     * the catastrophe brake.
+     */
+    public static final int DEFAULT_ROW_FETCH_SIZE = 500;
 
     private EdgeConfig(Map<String, String> env) {
         this.controllerId       = env.getOrDefault("CONTROLLER_ID", "edge-default");
@@ -30,6 +41,26 @@ public final class EdgeConfig {
         this.logSource          = env.getOrDefault("LOG_SOURCE", "/var/log/monitored/app.log");
         this.heartbeatIntervalMs = Long.parseLong(env.getOrDefault("HEARTBEAT_INTERVAL_MS", "30000"));
         this.discoveryDelayMs   = Long.parseLong(env.getOrDefault("DISCOVERY_DELAY_MS", "5000"));
+        this.defaultRowFetchSize = parseDefaultRowFetchSize(
+            env.getOrDefault("DEFAULT_ROW_FETCH_SIZE",
+                Integer.toString(DEFAULT_ROW_FETCH_SIZE))
+        );
+    }
+
+    /**
+     * Phase 13 / REK.T6 — Parse the configured fetch size. Non-positive
+     * or unparseable values fall back to {@link #DEFAULT_ROW_FETCH_SIZE}
+     * so a typo in deployment env does not silently disable the safety
+     * net by passing fetchSize=0 (which PG JDBC interprets as "no
+     * cursor streaming — materialize everything").
+     */
+    private static int parseDefaultRowFetchSize(String raw) {
+        try {
+            int value = Integer.parseInt(raw);
+            return value > 0 ? value : DEFAULT_ROW_FETCH_SIZE;
+        } catch (NumberFormatException e) {
+            return DEFAULT_ROW_FETCH_SIZE;
+        }
     }
 
     public static EdgeConfig fromSystem() {
@@ -52,4 +83,5 @@ public final class EdgeConfig {
     public String logSource()          { return logSource; }
     public long heartbeatIntervalMs()  { return heartbeatIntervalMs; }
     public long discoveryDelayMs()     { return discoveryDelayMs; }
+    public int defaultRowFetchSize()   { return defaultRowFetchSize; }
 }
