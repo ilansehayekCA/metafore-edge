@@ -27,8 +27,42 @@ public final class MessageFactory {
         return msg;
     }
 
+    /**
+     * Backward-compat 5-arg overload. Calls the Phase 14.9 / ETA.T2
+     * 7-arg variant with {@code runtime=null}, {@code runtimeHints=null}
+     * — emitting a payload that older Phase-13 schemas validated
+     * (no runtime field present). Production callers should use the
+     * 7-arg form; this overload exists so test fixtures + any legacy
+     * call sites continue to compile without churn.
+     */
     public static Map<String, Object> registration(EdgeConfig config,
             List<String> capabilities, String dbType, String dbHost, Integer dbPort) {
+        return registration(config, capabilities, dbType, dbHost, dbPort, null, null);
+    }
+
+    /**
+     * Phase 14.9 / ETA.T2 — extended registration payload composer.
+     *
+     * <p>Adds two optional fields on the wire:
+     * <ul>
+     *   <li>{@code runtime} — wire-string form of the
+     *       {@link com.metafore.edge.config.EdgeRuntime} classification
+     *       ({@code docker} | {@code native} | {@code docker-host-network}
+     *       | {@code unknown}). Omitted when {@code runtime} is null or
+     *       blank.</li>
+     *   <li>{@code runtime_hints} — diagnostic context map (5
+     *       whitelisted keys). Omitted when {@code runtimeHints} is null
+     *       or empty.</li>
+     * </ul>
+     *
+     * <p>Both fields are OPTIONAL on the schema (see
+     * {@code contracts/mqtt/registration.schema.json}) so older edges
+     * that don't ship them still validate. Core treats absence as
+     * {@code runtime=unknown}.
+     */
+    public static Map<String, Object> registration(EdgeConfig config,
+            List<String> capabilities, String dbType, String dbHost, Integer dbPort,
+            String runtime, Map<String, Object> runtimeHints) {
         Map<String, Object> msg = new LinkedHashMap<>();
         msg.put("controller_id", config.controllerId());
         msg.put("tenant_id", config.tenantId());
@@ -47,6 +81,12 @@ public final class MessageFactory {
         String dbName = config.dbName();
         if (dbName != null && !dbName.isEmpty()) {
             msg.put("db_name", dbName);
+        }
+        if (runtime != null && !runtime.isBlank()) {
+            msg.put("runtime", runtime);
+        }
+        if (runtimeHints != null && !runtimeHints.isEmpty()) {
+            msg.put("runtime_hints", runtimeHints);
         }
         return msg;
     }

@@ -56,6 +56,72 @@ class MessageFactoryTest {
         validate(msg, "registration.schema.json");
     }
 
+    // ── Phase 14.9 / ETA.T2 — runtime + runtime_hints additive fields ──
+
+    @Test
+    void registrationLegacyOverloadOmitsRuntime() {
+        // Back-compat invariant: the 5-arg overload must produce a
+        // payload identical-in-shape to pre-14.9. Older edges that
+        // never call the 7-arg form ship payloads without runtime; the
+        // schema still validates them.
+        Map<String, Object> msg = MessageFactory.registration(
+            config, List.of("jdbc"), null, null, null);
+        assertFalse(msg.containsKey("runtime"));
+        assertFalse(msg.containsKey("runtime_hints"));
+    }
+
+    @Test
+    void registrationWithRuntimeEmitsField() throws Exception {
+        Map<String, Object> hints = new LinkedHashMap<>();
+        hints.put("os_name", "Windows 11");
+        hints.put("java_version", "21.0.2");
+        hints.put("hostname", "laptop-001");
+        hints.put("docker_env_file_present", false);
+        hints.put("cgroup_signature", "unavailable");
+        Map<String, Object> msg = MessageFactory.registration(
+            config, List.of("jdbc"), "postgresql", "localhost", 5432,
+            "native", hints);
+        assertEquals("native", msg.get("runtime"));
+        assertEquals(hints, msg.get("runtime_hints"));
+        validate(msg, "registration.schema.json");
+    }
+
+    @Test
+    void registrationWithRuntimeDockerHostNetworkValidates() throws Exception {
+        Map<String, Object> msg = MessageFactory.registration(
+            config, List.of("jdbc"), "postgresql", "localhost", 5432,
+            "docker-host-network", Map.of("os_name", "Linux"));
+        assertEquals("docker-host-network", msg.get("runtime"));
+        validate(msg, "registration.schema.json");
+    }
+
+    @Test
+    void registrationWithUnknownRuntimeValidates() throws Exception {
+        Map<String, Object> msg = MessageFactory.registration(
+            config, List.of("jdbc"), null, null, null,
+            "unknown", null);
+        assertEquals("unknown", msg.get("runtime"));
+        // null/empty hints map is omitted from the wire payload.
+        assertFalse(msg.containsKey("runtime_hints"));
+        validate(msg, "registration.schema.json");
+    }
+
+    @Test
+    void registrationWithBlankRuntimeOmitsField() {
+        Map<String, Object> msg = MessageFactory.registration(
+            config, List.of("jdbc"), null, null, null,
+            "   ", null);
+        assertFalse(msg.containsKey("runtime"));
+    }
+
+    @Test
+    void registrationWithEmptyHintsOmitsField() {
+        Map<String, Object> msg = MessageFactory.registration(
+            config, List.of("jdbc"), null, null, null,
+            "docker", Map.of());
+        assertFalse(msg.containsKey("runtime_hints"));
+    }
+
     @Test
     void eventMatchesSchema() throws Exception {
         Map<String, Object> msg = MessageFactory.event(
