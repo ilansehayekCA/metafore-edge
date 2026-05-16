@@ -38,8 +38,13 @@ public class RegistrationRoute extends RouteBuilder {
                 Integer dbPort = dsRegistry.isDefaultConnected()
                     ? Integer.parseInt(config.dbPort()) : null;
 
+                // Phase 14.9 / ETA.T2 — advertise the auto-detected
+                // edge runtime + frozen diagnostic hints map alongside
+                // the existing db_* fields. Both are OPTIONAL on the
+                // schema so older cores ignore them.
                 exchange.getIn().setBody(MessageFactory.registration(
-                    config, capabilities, dbType, dbHost, dbPort));
+                    config, capabilities, dbType, dbHost, dbPort,
+                    config.runtime(), config.runtimeHints()));
             })
             .marshal().json()
             .to("paho:" + topics.telemetryRegistration()

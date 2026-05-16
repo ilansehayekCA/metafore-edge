@@ -17,7 +17,17 @@
     },
     "db_type": { "type": "string", "enum": ["mariadb", "mysql", "postgresql", "oracle", "mssql", "none"] },
     "db_host": { "type": "string" },
-    "db_port": { "type": "integer" }
+    "db_port": { "type": "integer" },
+    "runtime": {
+      "type": "string",
+      "enum": ["docker", "native", "docker-host-network", "unknown"],
+      "description": "Phase 14.9 — Edge process topology, auto-detected at startup; informs mount-time host validation. OPTIONAL field; absence is treated as 'unknown' by metafore-core."
+    },
+    "runtime_hints": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Phase 14.9 — Free-form diagnostic context backing the runtime classification."
+    }
   },
   "additionalProperties": false
 }
