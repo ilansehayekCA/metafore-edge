@@ -1,6 +1,16 @@
 package com.metafore.edge.route;
 
+import com.metafore.edge.config.EdgeConfig;
+import com.metafore.edge.service.ConnectionTester;
+import com.metafore.edge.service.DataSourceRegistry;
+import com.metafore.edge.topic.TopicBuilder;
+import org.apache.camel.impl.DefaultCamelContext;
 import org.junit.jupiter.api.Test;
+
+import java.lang.reflect.Method;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -89,6 +99,93 @@ class RouteExecutorRouteTest {
             RouteExecutorRoute.PayloadKind.MISSING,
             RouteExecutorRoute.classifyPayload(null, null)
         );
+    }
+
+    // ── Phase 14.12 / MTBC.T1 — connect_and_ping verb routing ──
+
+    /**
+     * Probe an unresolvable host so we exercise the full
+     * handleConnectAndPing → ConnectionTester.probe → MessageFactory
+     * envelope path without needing a live PG. The dsRegistry must not
+     * receive any side-effect for either success or failure.
+     */
+    @Test
+    void connectAndPingDoesNotRegisterDataSource() throws Exception {
+        DefaultCamelContext ctx = new DefaultCamelContext();
+        DataSourceRegistry registry = new DataSourceRegistry(ctx);
+        EdgeConfig cfg = EdgeConfig.from(java.util.Collections.emptyMap());
+        TopicBuilder topics =
+            new TopicBuilder(cfg.tenantId(), cfg.controllerId());
+        RouteExecutorRoute route =
+            new RouteExecutorRoute(cfg, topics, registry);
+
+        Method m = RouteExecutorRoute.class.getDeclaredMethod(
+            "handleConnectAndPing", String.class, Map.class);
+        m.setAccessible(true);
+
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("db_host", "this-host-does-not-exist.invalid");
+        params.put("db_port", "5432");
+        params.put("db_name", "pharma");
+        params.put("db_user", "u");
+        params.put("db_pass", "p");
+        Map<String, Object> cmd = new HashMap<>();
+        cmd.put("action", "connect_and_ping");
+        cmd.put("route_id", "test-probe-1");
+        cmd.put("parameters", params);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> result = (Map<String, Object>)
+            m.invoke(route, "test-probe-1", cmd);
+
+        // Typed reason routed through the error field.
+        assertEquals("error", result.get("status"));
+        assertEquals("connect_and_ping", result.get("action"));
+        assertEquals("host_unresolved", result.get("error"));
+        assertNotNull(result.get("error_details"));
+
+        // No registry side-effect — the next get() returns null (no
+        // default DS bound either in this test fixture).
+        assertNull(registry.get("test-probe-1"));
+    }
+
+    @Test
+    void connectAndPingBlankHostReturnsUnknown() throws Exception {
+        DefaultCamelContext ctx = new DefaultCamelContext();
+        DataSourceRegistry registry = new DataSourceRegistry(ctx);
+        EdgeConfig cfg = EdgeConfig.from(java.util.Collections.emptyMap());
+        TopicBuilder topics =
+            new TopicBuilder(cfg.tenantId(), cfg.controllerId());
+        RouteExecutorRoute route =
+            new RouteExecutorRoute(cfg, topics, registry);
+
+        Method m = RouteExecutorRoute.class.getDeclaredMethod(
+            "handleConnectAndPing", String.class, Map.class);
+        m.setAccessible(true);
+
+        Map<String, Object> cmd = new HashMap<>();
+        cmd.put("action", "connect_and_ping");
+        cmd.put("route_id", "test-probe-2");
+        cmd.put("parameters", new LinkedHashMap<>());
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> result = (Map<String, Object>)
+            m.invoke(route, "test-probe-2", cmd);
+        // No db_host → ConnectionTester returns reason=unknown,
+        // message="host is required".
+        assertEquals("error", result.get("status"));
+        assertEquals("unknown", result.get("error"));
+    }
+
+    @Test
+    void connectAndPingProbeResultExposesTypedReason() {
+        // Direct ConnectionTester invocation — guards against future
+        // refactors that bypass classify(). RFC-6761 reserved TLD
+        // ensures DNS lookup terminates fast with NXDOMAIN.
+        ConnectionTester.ProbeResult r = ConnectionTester.probe(
+            "no-such-host-anywhere.invalid", "5432", "x", "u", "p");
+        assertFalse(r.ok());
+        assertEquals("host_unresolved", r.reason());
     }
 
     @Test

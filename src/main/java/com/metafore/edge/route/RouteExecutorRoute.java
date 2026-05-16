@@ -2,6 +2,7 @@ package com.metafore.edge.route;
 
 import com.metafore.edge.config.EdgeConfig;
 import com.metafore.edge.message.MessageFactory;
+import com.metafore.edge.service.ConnectionTester;
 import com.metafore.edge.service.DataSourceRegistry;
 import com.metafore.edge.service.ShellExecutor;
 import com.metafore.edge.service.SqlExecutor;
@@ -40,6 +41,12 @@ public class RouteExecutorRoute extends RouteBuilder {
 
                 if ("deploy".equals(action) || "execute".equals(action)) {
                     result = handleExecute(routeId, cmd);
+                } else if ("connect_and_ping".equals(action)) {
+                    // Phase 14.12 / MTBC.T1 — ephemeral connection
+                    // probe. Does NOT touch dsRegistry; does NOT route
+                    // through SqlExecutor whitelist. See
+                    // ConnectionTester for the typed-reason taxonomy.
+                    result = handleConnectAndPing(routeId, cmd);
                 } else if ("remove".equals(action)) {
                     dsRegistry.remove(routeId);
                     result = MessageFactory.routeResult(config, routeId,
@@ -278,6 +285,54 @@ public class RouteExecutorRoute extends RouteBuilder {
         String error = (String) execResult.get("error");
         return MessageFactory.routeResult(config, routeId,
             status, action, latency, rowCount, rowsAffected, data, error, null);
+    }
+
+    /**
+     * Phase 14.12 / MTBC.T1 — handle a {@code connect_and_ping} verb.
+     *
+     * <p>Reads {@code db_host}, {@code db_port}, {@code db_name},
+     * {@code db_user}, {@code db_pass} from the command parameters
+     * (case-tolerant per existing {@link #str} helper), opens a
+     * transient JDBC connection from the edge's <em>runtime context</em>,
+     * runs {@code SELECT version(), current_database()}, returns the
+     * standard routeResult envelope with the typed reason on failure.
+     *
+     * <p>Crucially: no side effect. {@link DataSourceRegistry} is NOT
+     * touched. The transient {@code DataSource} is closed via
+     * try-with-resources inside {@link ConnectionTester#probe} and goes
+     * out of scope when this method returns.
+     *
+     * <p>The probe action on the wire is {@code "connect_and_ping"} so
+     * core's response handler can demultiplex from routine reads.
+     * Error envelope uses the typed reason (e.g. {@code "host_unresolved"})
+     * as the {@code error} field — assistant routes on this without
+     * parsing free-text. The raw driver message goes in
+     * {@code error_details} for the diagnostic collapsible in the UI.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> handleConnectAndPing(
+        String routeId, Map<String, Object> cmd
+    ) {
+        Map<String, Object> params = (Map<String, Object>)
+            cmd.getOrDefault("parameters", Collections.emptyMap());
+
+        String dbHost = str(params, "db_host", "DB_HOST", "");
+        String dbPort = str(params, "db_port", "DB_PORT", "5432");
+        String dbName = str(params, "db_name", "DB_NAME", "");
+        String dbUser = str(params, "db_user", "DB_USER", "");
+        String dbPass = str(params, "db_pass", "DB_PASS", "");
+
+        ConnectionTester.ProbeResult probe =
+            ConnectionTester.probe(dbHost, dbPort, dbName, dbUser, dbPass);
+
+        if (probe.ok()) {
+            return MessageFactory.routeResult(config, routeId,
+                "success", "connect_and_ping", probe.latencyMs(),
+                null, null, probe.data(), null, null);
+        }
+        return MessageFactory.routeResult(config, routeId,
+            "error", "connect_and_ping", probe.latencyMs(),
+            null, null, null, probe.reason(), probe.message());
     }
 
     private static String str(Map<String, Object> params,
