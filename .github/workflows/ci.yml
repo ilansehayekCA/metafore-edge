@@ -69,6 +69,37 @@ jobs:
         env:
           ECR_REGISTRY: 359469026479.dkr.ecr.us-east-1.amazonaws.com
 
+      # Phase 14.19 — AC Register Wizard fix. Mirror the edge image to a
+      # PUBLIC GHCR repo so customers with only Docker Desktop installed
+      # can `docker pull` the image from the wizard snippet without
+      # needing ECR credentials. ECR push above stays primary for the
+      # cluster's own metafore-edge deployment; GHCR is the public
+      # distribution channel referenced by METAFORE_EDGE_IMAGE.
+      #
+      # NOTE FOR OPERATOR: this step requires a one-time secret setup —
+      # GitHub: Settings → Secrets and variables → Actions → New
+      # repository secret → name `GHCR_TOKEN`, value = a Personal Access
+      # Token (classic) with `write:packages` scope. Without it this
+      # step fails. The ECR push above is unaffected by GHCR_TOKEN's
+      # absence (preceding step succeeds independently).
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Push to GHCR
+        run: |
+          docker tag $ECR_REGISTRY/metafore-ilan/metafore-edge:${{ github.sha }} \
+            ghcr.io/${{ github.repository_owner }}/metafore-edge:${{ github.sha }}
+          docker tag $ECR_REGISTRY/metafore-ilan/metafore-edge:${{ github.sha }} \
+            ghcr.io/${{ github.repository_owner }}/metafore-edge:latest
+          docker push ghcr.io/${{ github.repository_owner }}/metafore-edge:${{ github.sha }}
+          docker push ghcr.io/${{ github.repository_owner }}/metafore-edge:latest
+        env:
+          ECR_REGISTRY: 359469026479.dkr.ecr.us-east-1.amazonaws.com
+
       - name: Deploy to EKS
         run: |
           aws eks update-kubeconfig --name metafore-ilan-project-dev --region us-east-1
