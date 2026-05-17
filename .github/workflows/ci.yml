@@ -95,12 +95,16 @@ jobs:
 
       - name: Push to GHCR
         run: |
+          # GHCR / Docker registry paths must be lowercase; the owner
+          # slug `ilansehayekCA` is mixed-case so we downcase before
+          # constructing the tag.
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           docker tag $ECR_REGISTRY/metafore-ilan/metafore-edge:${{ github.sha }} \
-            ghcr.io/${{ github.repository_owner }}/metafore-edge:${{ github.sha }}
+            ghcr.io/$OWNER/metafore-edge:${{ github.sha }}
           docker tag $ECR_REGISTRY/metafore-ilan/metafore-edge:${{ github.sha }} \
-            ghcr.io/${{ github.repository_owner }}/metafore-edge:latest
-          docker push ghcr.io/${{ github.repository_owner }}/metafore-edge:${{ github.sha }}
-          docker push ghcr.io/${{ github.repository_owner }}/metafore-edge:latest
+            ghcr.io/$OWNER/metafore-edge:latest
+          docker push ghcr.io/$OWNER/metafore-edge:${{ github.sha }}
+          docker push ghcr.io/$OWNER/metafore-edge:latest
         env:
           ECR_REGISTRY: 359469026479.dkr.ecr.us-east-1.amazonaws.com
 
