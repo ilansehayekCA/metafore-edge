@@ -1,5 +1,17 @@
 package com.metafore.edge.topic;
 
+/**
+ * Builds MQTT topic strings for a (tenant, controller) pair.
+ *
+ * <p>Phase 14.18 — when an edge serves N tenants from one physical
+ * process, callers construct one {@code TopicBuilder} per tenant
+ * (same {@code controllerId}, different {@code tenantId}). All
+ * topic strings remain tenant-scoped: telemetry fans out one publisher
+ * per tenant, control fans out one subscription per tenant. The
+ * tenant_id segment of the path remains the security boundary
+ * (broker-side ACL enforces who can subscribe to which tenant —
+ * tracked separately as W-024).
+ */
 public final class TopicBuilder {
 
     private final String tenantId;
@@ -9,6 +21,12 @@ public final class TopicBuilder {
         this.tenantId = tenantId;
         this.controllerId = controllerId;
     }
+
+    /** Phase 14.18 — slug-scoped accessor used by route IDs / log
+     *  lines so a multi-tenant edge can report which tenant a route
+     *  belongs to in diagnostics. */
+    public String tenantId()         { return tenantId; }
+    public String controllerId()     { return controllerId; }
 
     // Access Controller -> Core (telemetry)
     public String telemetryRegistration() { return telemetry("registration"); }

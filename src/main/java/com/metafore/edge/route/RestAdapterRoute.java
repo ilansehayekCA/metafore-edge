@@ -59,8 +59,11 @@ public class RestAdapterRoute extends RouteBuilder {
 
     @Override
     public void configure() {
+        // Phase 14.18 — per-tenant routeId so each tenant's write-back
+        // subscription is independently named in Camel diagnostics.
+        String routeId = "rest-adapter-" + topics.tenantId();
         from("paho:" + topics.controlWriteBack() + "?brokerUrl=" + config.brokerUrl())
-            .routeId("rest-adapter")
+            .routeId(routeId)
             .log("Write-back command received: ${body}")
             .unmarshal().json(Map.class)
             .process(exchange -> {

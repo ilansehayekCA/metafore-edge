@@ -28,41 +28,64 @@ public final class MessageFactory {
     }
 
     /**
-     * Backward-compat 5-arg overload. Calls the Phase 14.9 / ETA.T2
-     * 7-arg variant with {@code runtime=null}, {@code runtimeHints=null}
+     * Backward-compat 5-arg overload. Calls the 8-arg variant with
+     * {@code runtime=null}, {@code runtimeHints=null}, {@code tenants=null}
      * — emitting a payload that older Phase-13 schemas validated
-     * (no runtime field present). Production callers should use the
-     * 7-arg form; this overload exists so test fixtures + any legacy
-     * call sites continue to compile without churn.
+     * (no runtime field, no tenants array). Production callers should
+     * use the 8-arg form; this overload exists so test fixtures + any
+     * legacy call sites continue to compile without churn.
      */
     public static Map<String, Object> registration(EdgeConfig config,
             List<String> capabilities, String dbType, String dbHost, Integer dbPort) {
-        return registration(config, capabilities, dbType, dbHost, dbPort, null, null);
+        return registration(config, capabilities, dbType, dbHost, dbPort,
+            null, null, null);
     }
 
     /**
-     * Phase 14.9 / ETA.T2 — extended registration payload composer.
-     *
-     * <p>Adds two optional fields on the wire:
-     * <ul>
-     *   <li>{@code runtime} — wire-string form of the
-     *       {@link com.metafore.edge.config.EdgeRuntime} classification
-     *       ({@code docker} | {@code native} | {@code docker-host-network}
-     *       | {@code unknown}). Omitted when {@code runtime} is null or
-     *       blank.</li>
-     *   <li>{@code runtime_hints} — diagnostic context map (5
-     *       whitelisted keys). Omitted when {@code runtimeHints} is null
-     *       or empty.</li>
-     * </ul>
-     *
-     * <p>Both fields are OPTIONAL on the schema (see
-     * {@code contracts/mqtt/registration.schema.json}) so older edges
-     * that don't ship them still validate. Core treats absence as
-     * {@code runtime=unknown}.
+     * Phase 14.9 / ETA.T2 backward-compat 7-arg overload (no tenants).
+     * Calls the 8-arg variant with {@code tenants=null} — emits the
+     * pre-14.18 payload shape (singleton {@code tenant_id} only, no
+     * {@code tenants} array). Kept so existing call sites that only
+     * care about runtime advertisement compile without change.
      */
     public static Map<String, Object> registration(EdgeConfig config,
             List<String> capabilities, String dbType, String dbHost, Integer dbPort,
             String runtime, Map<String, Object> runtimeHints) {
+        return registration(config, capabilities, dbType, dbHost, dbPort,
+            runtime, runtimeHints, null);
+    }
+
+    /**
+     * Phase 14.18 — extended registration payload composer with
+     * {@code tenants} array support.
+     *
+     * <p>Wire fields (in order):
+     * <ul>
+     *   <li>{@code controller_id}, {@code tenant_id} (singleton —
+     *       legacy single-tenant edges + back-compat for cores that
+     *       ignore the {@code tenants} array)</li>
+     *   <li>{@code timestamp}, {@code version}, {@code capabilities}</li>
+     *   <li>{@code db_type}, {@code db_host}, {@code db_port},
+     *       {@code db_name} (when set)</li>
+     *   <li>{@code runtime}, {@code runtime_hints} (Phase 14.9 —
+     *       omitted when null/blank/empty)</li>
+     *   <li>{@code tenants: [slug,...]} (Phase 14.18 — omitted when
+     *       null/empty; emitted only when the edge declares
+     *       {@code TENANT_IDS=a,b,...}). When present, core's
+     *       {@code _handle_registration} writes one
+     *       {@code (:Tenant)-[:HAS_CONTROLLER]->(:AccessController)}
+     *       edge per tenant slug. Bindings are additive.</li>
+     * </ul>
+     *
+     * <p>All fields except controller_id / tenant_id / timestamp /
+     * version / capabilities are OPTIONAL on the schema (see
+     * {@code contracts/mqtt/registration.schema.json}) so older cores
+     * ignore unknown fields.
+     */
+    public static Map<String, Object> registration(EdgeConfig config,
+            List<String> capabilities, String dbType, String dbHost, Integer dbPort,
+            String runtime, Map<String, Object> runtimeHints,
+            List<String> tenants) {
         Map<String, Object> msg = new LinkedHashMap<>();
         msg.put("controller_id", config.controllerId());
         msg.put("tenant_id", config.tenantId());
@@ -87,6 +110,13 @@ public final class MessageFactory {
         }
         if (runtimeHints != null && !runtimeHints.isEmpty()) {
             msg.put("runtime_hints", runtimeHints);
+        }
+        if (tenants != null && !tenants.isEmpty()) {
+            // Phase 14.18 — Defensive copy: caller may pass an
+            // unmodifiable view from EdgeConfig#tenants(). Serialization
+            // doesn't mutate, but downstream tests inspect msg directly,
+            // so emit a plain LinkedHashList equivalent.
+            msg.put("tenants", new java.util.ArrayList<>(tenants));
         }
         return msg;
     }

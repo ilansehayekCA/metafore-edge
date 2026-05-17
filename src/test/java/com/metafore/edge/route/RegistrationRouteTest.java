@@ -38,7 +38,8 @@ class RegistrationRouteTest extends CamelTestSupport {
     @Test
     @SuppressWarnings("unchecked")
     void registrationFiresOnce() throws Exception {
-        AdviceWith.adviceWith(context, "registration", a -> {
+        // Phase 14.18 — routeId is suffixed with the tenant slug.
+        AdviceWith.adviceWith(context, "registration-test-tenant", a -> {
             a.weaveByToUri("paho:*").replace().to("mock:registration");
         });
         context.start();
@@ -54,5 +55,8 @@ class RegistrationRouteTest extends CamelTestSupport {
         assertEquals("1.0.0", msg.get("version"));
         assertNotNull(msg.get("capabilities"));
         assertTrue(((List<?>) msg.get("capabilities")).contains("shell"));
+        // Phase 14.18 — single-tenant config — `tenants` carries
+        // [tenant_id] from EdgeConfig back-compat path.
+        assertEquals(List.of("test-tenant"), msg.get("tenants"));
     }
 }

@@ -122,6 +122,79 @@ class MessageFactoryTest {
         assertFalse(msg.containsKey("runtime_hints"));
     }
 
+    // ── Phase 14.18 — tenants array on registration payload ──────────
+
+    @Test
+    void registrationWithTenantsListEmitsArray() throws Exception {
+        Map<String, Object> msg = MessageFactory.registration(
+            config, List.of("jdbc"), "postgresql", "localhost", 5432,
+            "native", Map.of("os_name", "Linux"),
+            List.of("metafore-corp", "metafore-walkthrough"));
+        assertEquals(
+            List.of("metafore-corp", "metafore-walkthrough"),
+            msg.get("tenants"));
+        validate(msg, "registration.schema.json");
+    }
+
+    @Test
+    void registrationWithSingleTenantValidates() throws Exception {
+        Map<String, Object> msg = MessageFactory.registration(
+            config, List.of("jdbc"), "postgresql", "localhost", 5432,
+            "native", null, List.of("metafore-corp"));
+        assertEquals(List.of("metafore-corp"), msg.get("tenants"));
+        validate(msg, "registration.schema.json");
+    }
+
+    @Test
+    void registrationLegacy7ArgOverloadOmitsTenants() {
+        // Back-compat invariant: the 7-arg overload (pre-Phase 14.18)
+        // must produce a payload without the `tenants` field. Older
+        // edges that never call the 8-arg form continue to ship
+        // payloads that older cores validate as single-tenant.
+        Map<String, Object> msg = MessageFactory.registration(
+            config, List.of("jdbc"), null, null, null,
+            "native", Map.of("os_name", "Linux"));
+        assertFalse(msg.containsKey("tenants"));
+    }
+
+    @Test
+    void registrationWithNullTenantsOmitsField() throws Exception {
+        Map<String, Object> msg = MessageFactory.registration(
+            config, List.of("jdbc"), null, null, null,
+            "native", null, null);
+        assertFalse(msg.containsKey("tenants"));
+        validate(msg, "registration.schema.json");
+    }
+
+    @Test
+    void registrationWithEmptyTenantsOmitsField() throws Exception {
+        Map<String, Object> msg = MessageFactory.registration(
+            config, List.of("jdbc"), null, null, null,
+            "native", null, List.of());
+        assertFalse(msg.containsKey("tenants"));
+        validate(msg, "registration.schema.json");
+    }
+
+    @Test
+    void registrationTenantsArrayIsDefensivelyCopied() {
+        // Caller may pass an unmodifiable List from EdgeConfig#tenants().
+        // The composer must emit a mutable copy so downstream JSON
+        // serialization + test assertions don't fight with the
+        // unmodifiable view.
+        List<String> source = List.of("a", "b");
+        Map<String, Object> msg = MessageFactory.registration(
+            config, List.of("jdbc"), null, null, null,
+            null, null, source);
+        Object emitted = msg.get("tenants");
+        assertTrue(emitted instanceof List);
+        // Mutable: should not throw.
+        @SuppressWarnings("unchecked")
+        List<String> emittedList = (List<String>) emitted;
+        emittedList.add("c");
+        // Source list is unchanged (no aliasing into msg).
+        assertEquals(List.of("a", "b"), source);
+    }
+
     @Test
     void eventMatchesSchema() throws Exception {
         Map<String, Object> msg = MessageFactory.event(
