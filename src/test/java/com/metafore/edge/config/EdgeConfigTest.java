@@ -14,9 +14,11 @@ class EdgeConfigTest {
         assertEquals("edge-default", cfg.controllerId());
         assertEquals("default-tenant", cfg.tenantId());
         assertEquals("tcp://mqtt-broker:1883", cfg.brokerUrl());
-        // Phase 14.9 / ETA.T2 — wire-protocol bump signalling the
-        // additive runtime + runtime_hints registration payload fields.
-        assertEquals("1.1.0", cfg.edgeVersion());
+        // Phase 14.18 — wire-protocol bump (1.1.0 → 1.2.0) signalling
+        // the additive `tenants` array on the registration payload.
+        // 1.1.0 was the Phase 14.9 / ETA.T2 bump that added runtime +
+        // runtime_hints; 1.2.0 adds multi-tenant binding support.
+        assertEquals("1.2.0", cfg.edgeVersion());
         assertEquals("localhost", cfg.dbHost());
         // Slice 33.1.0 fixture fix: EdgeConfig.dbPort defaults to 5432
         // (PostgreSQL) since the 2026-04-12 MariaDB→PostgreSQL migration.
@@ -99,5 +101,73 @@ class EdgeConfigTest {
         assertTrue(hints.containsKey("hostname"));
         assertTrue(hints.containsKey("docker_env_file_present"));
         assertTrue(hints.containsKey("cgroup_signature"));
+    }
+
+    // ── Phase 14.18 — multi-tenant TENANT_IDS env parsing ─────────────
+
+    @Test
+    void tenantsFromTenantIdsCommaList() {
+        Map<String, String> env = new HashMap<>();
+        env.put("TENANT_IDS", "metafore-corp,metafore-walkthrough");
+        EdgeConfig cfg = EdgeConfig.from(env);
+        assertEquals(java.util.List.of("metafore-corp", "metafore-walkthrough"),
+            cfg.tenants());
+    }
+
+    @Test
+    void tenantsTrimsAndDropsBlanksAndDedupes() {
+        Map<String, String> env = new HashMap<>();
+        env.put("TENANT_IDS", "  a , b ,  , a , c , b ,,");
+        EdgeConfig cfg = EdgeConfig.from(env);
+        // Trim per element, drop blank, dedupe preserving insertion order.
+        assertEquals(java.util.List.of("a", "b", "c"), cfg.tenants());
+    }
+
+    @Test
+    void tenantsBackCompatToLegacyTenantId() {
+        // When TENANT_IDS is unset, fall back to [TENANT_ID].
+        Map<String, String> env = new HashMap<>();
+        env.put("TENANT_ID", "metafore-corp");
+        EdgeConfig cfg = EdgeConfig.from(env);
+        assertEquals(java.util.List.of("metafore-corp"), cfg.tenants());
+    }
+
+    @Test
+    void tenantsIgnoresLegacyTenantIdWhenTenantIdsPresent() {
+        // TENANT_IDS wins; singleton is not appended.
+        Map<String, String> env = new HashMap<>();
+        env.put("TENANT_IDS", "a,b");
+        env.put("TENANT_ID", "c");  // ignored
+        EdgeConfig cfg = EdgeConfig.from(env);
+        assertEquals(java.util.List.of("a", "b"), cfg.tenants());
+    }
+
+    @Test
+    void tenantsEmptyWhenBothEnvsBlank() {
+        // Defensive: no TENANT_IDS, no TENANT_ID — but TENANT_ID
+        // defaults to "default-tenant" so we'd still get [default-tenant].
+        // Test with both forcibly empty.
+        Map<String, String> env = new HashMap<>();
+        env.put("TENANT_IDS", "");
+        env.put("TENANT_ID", "");
+        EdgeConfig cfg = EdgeConfig.from(env);
+        assertEquals(java.util.List.of(), cfg.tenants());
+    }
+
+    @Test
+    void tenantsListIsImmutable() {
+        Map<String, String> env = new HashMap<>();
+        env.put("TENANT_IDS", "a,b");
+        EdgeConfig cfg = EdgeConfig.from(env);
+        assertThrows(UnsupportedOperationException.class,
+            () -> cfg.tenants().add("c"));
+    }
+
+    @Test
+    void edgeVersionDefaultBumpedTo120() {
+        // Phase 14.18 — wire-protocol version bump signals the additive
+        // `tenants` array on the registration payload.
+        EdgeConfig cfg = EdgeConfig.from(Map.of());
+        assertEquals("1.2.0", cfg.edgeVersion());
     }
 }

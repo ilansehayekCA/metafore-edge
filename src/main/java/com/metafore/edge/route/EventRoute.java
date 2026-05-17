@@ -17,10 +17,17 @@ public class EventRoute extends RouteBuilder {
 
     @Override
     public void configure() {
+        // Phase 14.18 — tenant-scoped routeId so multi-tenant edges
+        // can spawn one EventRoute per tenant without Camel duplicate
+        // routeId errors. The underlying file source is shared (one
+        // log file, one stream consumer) but the consumer wraps each
+        // event with the tenant's identity via the per-tenant
+        // TopicBuilder.
+        String routeId = "event-log-tail-" + topics.tenantId();
         from("stream:file?fileName=" + config.logSource()
             + "&scanStream=true&scanStreamDelay=1000"
             + "&retry=true&fileWatcher=true")
-            .routeId("event-log-tail")
+            .routeId(routeId)
             .filter(body().isNotNull())
             .filter(body().regex(".*(INFO|ERROR|WARN|CRITICAL).*"))
             .process(exchange -> {

@@ -27,9 +27,15 @@ public class RouteExecutorRoute extends RouteBuilder {
 
     @Override
     public void configure() {
+        // Phase 14.18 — routeId is suffixed with the tenant slug so a
+        // multi-tenant edge runs one independently-named route per
+        // tenant (route-executor-<slug>) and each subscription resolves
+        // to a tenant-scoped control topic. The tenant_id is implicit in
+        // the topic path; no header decode required.
+        String camelRouteId = "route-executor-" + topics.tenantId();
         from("paho:" + topics.controlRoutes() + "?brokerUrl=" + config.brokerUrl())
-            .routeId("route-executor")
-            .log("Route command received: ${body}")
+            .routeId(camelRouteId)
+            .log("Route command received on tenant=" + topics.tenantId() + ": ${body}")
             .unmarshal().json(Map.class)
             .process(exchange -> {
                 @SuppressWarnings("unchecked")

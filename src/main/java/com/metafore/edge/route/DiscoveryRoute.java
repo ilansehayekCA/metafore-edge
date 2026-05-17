@@ -22,9 +22,13 @@ public class DiscoveryRoute extends RouteBuilder {
 
     @Override
     public void configure() {
+        // Phase 14.18 — routeIds suffixed with tenant slug so multi-
+        // tenant edges instantiate one DiscoveryRoute per tenant
+        // without colliding on Camel's unique-routeId requirement.
+        String suffix = "-" + topics.tenantId();
         // Startup discovery (one-shot)
-        from("timer:discovery?repeatCount=1&delay=" + config.discoveryDelayMs())
-            .routeId("discovery-startup")
+        from("timer:discovery" + suffix + "?repeatCount=1&delay=" + config.discoveryDelayMs())
+            .routeId("discovery-startup" + suffix)
             .process(exchange -> {
                 Map<String, Object> scope = DiscoveryService.defaultScope();
                 Map<String, Object> capabilities =
@@ -40,7 +44,7 @@ public class DiscoveryRoute extends RouteBuilder {
         // On-demand discovery (from Core)
         from("paho:" + topics.controlDiscovery()
             + "?brokerUrl=" + config.brokerUrl())
-            .routeId("discovery-ondemand")
+            .routeId("discovery-ondemand" + suffix)
             .log("Discovery command received")
             .unmarshal().json(Map.class)
             .process(exchange -> {

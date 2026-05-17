@@ -1,12 +1,17 @@
 package com.metafore.edge.config;
 
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 
 public final class EdgeConfig {
 
     private final String controllerId;
     private final String tenantId;
+    private final List<String> tenants;
     private final String brokerUrl;
     private final String edgeVersion;
     private final String dbHost;
@@ -40,14 +45,24 @@ public final class EdgeConfig {
     public static final int DEFAULT_ROW_FETCH_SIZE = 500;
 
     /**
-     * Phase 14.9 / ETA.T2 — default edge wire-protocol version.
-     * Bumped from {@code 1.0.0} → {@code 1.1.0} when the registration
-     * payload gained the optional {@code runtime} + {@code runtime_hints}
-     * fields. Older cores ignore the new fields; older edges that
-     * still report {@code 1.0.0} are treated as {@code runtime=unknown}
-     * by the core registration handler. No client-side gating.
+     * Phase 14.18 — default edge wire-protocol version.
+     *
+     * <p>Bumped from {@code 1.1.0} → {@code 1.2.0} when the registration
+     * payload gained the optional {@code tenants} array (multi-tenant
+     * edge binding). Older cores ignore the new field; older edges that
+     * still report {@code 1.1.0} are treated as single-tenant by core's
+     * {@code _handle_registration} (legacy {@code tenant_id} branch).
+     *
+     * <p>Version history:
+     * <ul>
+     *   <li>{@code 1.0.0} — Phase 13 baseline.
+     *   <li>{@code 1.1.0} — Phase 14.9: added {@code runtime} +
+     *       {@code runtime_hints}.
+     *   <li>{@code 1.2.0} — Phase 14.18: added {@code tenants}
+     *       (multi-tenant binding).
+     * </ul>
      */
-    public static final String DEFAULT_EDGE_VERSION = "1.1.0";
+    public static final String DEFAULT_EDGE_VERSION = "1.2.0";
 
     private EdgeConfig(Map<String, String> env) {
         this(env, RuntimeProbe.Probes.system());
@@ -56,6 +71,14 @@ public final class EdgeConfig {
     private EdgeConfig(Map<String, String> env, RuntimeProbe.Probes probes) {
         this.controllerId       = env.getOrDefault("CONTROLLER_ID", "edge-default");
         this.tenantId           = env.getOrDefault("TENANT_ID", "default-tenant");
+        // Phase 14.18 — TENANT_IDS (comma-separated multi-tenant list)
+        // wins when present; otherwise fall back to the singleton
+        // TENANT_ID as a single-element list (legacy edges keep working
+        // without env churn). See parseTenantsEnv() for trim / dedupe /
+        // drop-empty rules. Stored as an unmodifiable list so downstream
+        // RegistrationRoute / RouteExecutorRoute treat it as immutable.
+        this.tenants            = Collections.unmodifiableList(
+            parseTenantsEnv(env.getOrDefault("TENANT_IDS", ""), this.tenantId));
         this.brokerUrl          = env.getOrDefault("BROKER_URL", "tcp://mqtt-broker:1883");
         this.edgeVersion        = env.getOrDefault("EDGE_VERSION", DEFAULT_EDGE_VERSION);
         this.dbHost             = env.getOrDefault("DB_HOST", "localhost");
@@ -75,6 +98,43 @@ public final class EdgeConfig {
         // ambiguity. Hints map carries the diagnostic context.
         this.runtime      = RuntimeProbe.detect(probes);
         this.runtimeHints = Collections.unmodifiableMap(RuntimeProbe.hints(probes));
+    }
+
+    /**
+     * Phase 14.18 — Parse {@code TENANT_IDS} (comma-separated tenant
+     * slug list) into a normalized list.
+     *
+     * <p>Rules:
+     * <ul>
+     *   <li>Split on {@code ,}.
+     *   <li>Trim whitespace per element.
+     *   <li>Drop empty / blank elements.
+     *   <li>Preserve insertion order; dedupe (case-preserving).
+     *   <li>If the resulting list is empty AND {@code legacyTenantId}
+     *       is non-blank, return {@code [legacyTenantId]} (back-compat
+     *       with single-tenant TENANT_ID deployments).
+     *   <li>If both are empty, return an empty list — callers
+     *       (RegistrationRoute, RouteExecutorRoute) must tolerate this
+     *       defensively (no subscriptions, no payload `tenants` field).
+     * </ul>
+     */
+    static List<String> parseTenantsEnv(String raw, String legacyTenantId) {
+        List<String> result = new ArrayList<>();
+        if (raw != null && !raw.isBlank()) {
+            LinkedHashSet<String> seen = new LinkedHashSet<>();
+            for (String part : raw.split(",")) {
+                String trimmed = part == null ? "" : part.trim();
+                if (trimmed.isEmpty()) continue;
+                if (seen.add(trimmed)) {
+                    result.add(trimmed);
+                }
+            }
+        }
+        if (result.isEmpty() && legacyTenantId != null
+                && !legacyTenantId.isBlank()) {
+            result.add(legacyTenantId.trim());
+        }
+        return result;
     }
 
     /**
@@ -111,6 +171,18 @@ public final class EdgeConfig {
 
     public String controllerId()       { return controllerId; }
     public String tenantId()           { return tenantId; }
+
+    /**
+     * Phase 14.18 — list of tenant slugs this physical edge serves.
+     *
+     * <p>Parsed from {@code TENANT_IDS} (comma-separated) at startup;
+     * falls through to {@code [TENANT_ID]} when {@code TENANT_IDS} is
+     * unset (back-compat with pre-1.2.0 single-tenant deployments).
+     * The list is immutable — never returns null, may return an empty
+     * list when both env vars are blank (callers tolerate empty for
+     * test / sandbox boot).
+     */
+    public List<String> tenants()      { return tenants; }
     public String brokerUrl()          { return brokerUrl; }
     public String edgeVersion()        { return edgeVersion; }
     public String dbHost()             { return dbHost; }
