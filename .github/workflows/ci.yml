@@ -48,6 +48,10 @@ jobs:
     permissions:
       id-token: write
       contents: read
+      # Phase 14.19 — AC Register Wizard fix. Required for the GHCR
+      # mirror push step below. Scoped here (not workflow-wide) so the
+      # test job stays minimum-privilege.
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -70,24 +74,24 @@ jobs:
           ECR_REGISTRY: 359469026479.dkr.ecr.us-east-1.amazonaws.com
 
       # Phase 14.19 — AC Register Wizard fix. Mirror the edge image to a
-      # PUBLIC GHCR repo so customers with only Docker Desktop installed
+      # public GHCR repo so customers with only Docker Desktop installed
       # can `docker pull` the image from the wizard snippet without
       # needing ECR credentials. ECR push above stays primary for the
       # cluster's own metafore-edge deployment; GHCR is the public
       # distribution channel referenced by METAFORE_EDGE_IMAGE.
       #
-      # NOTE FOR OPERATOR: this step requires a one-time secret setup —
-      # GitHub: Settings → Secrets and variables → Actions → New
-      # repository secret → name `GHCR_TOKEN`, value = a Personal Access
-      # Token (classic) with `write:packages` scope. Without it this
-      # step fails. The ECR push above is unaffected by GHCR_TOKEN's
-      # absence (preceding step succeeds independently).
+      # Auth uses the built-in GITHUB_TOKEN (no PAT to create) — see
+      # the `packages: write` permission on this job. After the FIRST
+      # successful push, the operator must visit the package page at
+      # https://github.com/<owner>?tab=packages → metafore-edge →
+      # Package settings → Change visibility → Public, otherwise the
+      # wizard's `docker pull` from a customer laptop hits a 401.
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GHCR_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push to GHCR
         run: |
