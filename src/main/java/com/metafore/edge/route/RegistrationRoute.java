@@ -2,11 +2,11 @@ package com.metafore.edge.route;
 
 import com.metafore.edge.config.EdgeConfig;
 import com.metafore.edge.message.MessageFactory;
+import com.metafore.edge.service.Capabilities;
 import com.metafore.edge.service.DataSourceRegistry;
 import com.metafore.edge.topic.TopicBuilder;
 import org.apache.camel.builder.RouteBuilder;
 
-import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -52,11 +52,16 @@ public class RegistrationRoute extends RouteBuilder {
         from("timer:" + routeId + "?repeatCount=1&delay=2000")
             .routeId(routeId)
             .process(exchange -> {
-                List<String> capabilities = new ArrayList<>();
-                capabilities.add("shell");
-                if (dsRegistry.isDefaultConnected()) {
-                    capabilities.add("jdbc");
-                }
+                // CCA.T2 / compass ba53231a — advertise the canonical
+                // capability set the image actually serves (mirrors
+                // core's KNOWN_AC_CAPABILITIES). Independent of whether
+                // a default DataSource is bound: a registered DS is a
+                // runtime concern; capability advertisement is about
+                // what the image CAN do. The legacy ["shell", "jdbc"]
+                // advertisement leaked transport flavor and confused
+                // the platform-side preflight, which keys on canonical
+                // capability names (read / write / introspect / ...).
+                List<String> capabilities = Capabilities.declaredList();
 
                 String dbType = dsRegistry.isDefaultConnected() ? "postgresql" : "none";
                 String dbHost = dsRegistry.isDefaultConnected() ? config.dbHost() : null;
