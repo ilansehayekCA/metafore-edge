@@ -2,6 +2,7 @@ package com.metafore.edge.route;
 
 import com.metafore.edge.config.EdgeConfig;
 import com.metafore.edge.message.MessageFactory;
+import com.metafore.edge.service.Capabilities;
 import com.metafore.edge.service.ConnectionTester;
 import com.metafore.edge.service.DataSourceRegistry;
 import com.metafore.edge.service.ShellExecutor;
@@ -43,7 +44,11 @@ public class RouteExecutorRoute extends RouteBuilder {
                 String action = (String) cmd.getOrDefault("action", "");
                 String routeId = (String) cmd.getOrDefault("route_id", "");
 
-                Map<String, Object> result;
+                Map<String, Object> result = enforceCapability(action, routeId, cmd);
+                if (result != null) {
+                    exchange.getIn().setBody(result);
+                    return;
+                }
 
                 if ("deploy".equals(action) || "execute".equals(action)) {
                     result = handleExecute(routeId, cmd);
@@ -69,6 +74,58 @@ public class RouteExecutorRoute extends RouteBuilder {
             .to("paho:" + topics.telemetryRouteResults()
                 + "?brokerUrl=" + config.brokerUrl())
             .log("Route result published");
+    }
+
+    /**
+     * CCA.T2 / compass ba53231a — capability enforcement at the
+     * dispatch boundary.
+     *
+     * <p>Returns:
+     * <ul>
+     *   <li>{@code null} when the action is unknown (let the existing
+     *       "Unknown action" branch surface it — that's a parse error,
+     *       not a capability denial) or when the required capability is
+     *       in the edge's declared set (let dispatch proceed).</li>
+     *   <li>A {@code capability_denied} envelope when the action's
+     *       required capability is NOT in {@link Capabilities#DECLARED}.
+     *       Envelope carries {@code status=rejected},
+     *       {@code error=capability_denied}, and {@code error_details}
+     *       naming the offending capability + the declared set, so the
+     *       core-side response handler can route the audit row + UI
+     *       message without parsing free-text.</li>
+     * </ul>
+     */
+    private Map<String, Object> enforceCapability(
+        String action, String routeId, Map<String, Object> cmd
+    ) {
+        return enforceCapability(
+            Capabilities.DECLARED, action, routeId, cmd);
+    }
+
+    /**
+     * Package-private overload — accepts a custom declared set so the
+     * denial path can be exercised in unit tests without rebuilding
+     * the image. Production callers go through the no-arg overload.
+     */
+    @SuppressWarnings("unchecked")
+    Map<String, Object> enforceCapability(
+        java.util.Set<String> declared,
+        String action, String routeId, Map<String, Object> cmd
+    ) {
+        Map<String, Object> params = (Map<String, Object>)
+            cmd.getOrDefault("parameters", Collections.emptyMap());
+        String required = Capabilities.deriveRequiredCapability(action, params);
+        if (required == null) {
+            return null;
+        }
+        if (declared.contains(required)) {
+            return null;
+        }
+        String details = "Edge does not advertise capability '" + required
+            + "' for action '" + action + "'. Declared: " + declared + ".";
+        return MessageFactory.routeResult(config, routeId,
+            "rejected", action, 0, null, null, null,
+            "capability_denied", details);
     }
 
     @SuppressWarnings("unchecked")

@@ -54,7 +54,22 @@ class RegistrationRouteTest extends CamelTestSupport {
         assertEquals("test-tenant", msg.get("tenant_id"));
         assertEquals("1.0.0", msg.get("version"));
         assertNotNull(msg.get("capabilities"));
-        assertTrue(((List<?>) msg.get("capabilities")).contains("shell"));
+        List<?> caps = (List<?>) msg.get("capabilities");
+        // CCA.T2 / compass ba53231a — canonical capability names
+        // (replaces legacy [shell] + [jdbc] advertisement).
+        assertTrue(caps.contains("shell"));
+        assertTrue(caps.contains("test_connection"),
+            "CCA.T2 — edge must advertise test_connection so the "
+            + "platform preflight can route connect_and_ping commands");
+        assertTrue(caps.contains("read"));
+        assertTrue(caps.contains("write"));
+        assertTrue(caps.contains("introspect"));
+        assertTrue(caps.contains("healthcheck"));
+        assertTrue(caps.contains("ddl"));
+        // Legacy transport-flavor strings must not leak.
+        assertFalse(caps.contains("jdbc"),
+            "CCA.T2 — legacy 'jdbc' advertisement must not leak; the "
+            + "platform preflight keys on canonical capability names");
         // Phase 14.18 — single-tenant config — `tenants` carries
         // [tenant_id] from EdgeConfig back-compat path.
         assertEquals(List.of("test-tenant"), msg.get("tenants"));
