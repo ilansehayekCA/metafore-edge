@@ -1,0 +1,53 @@
+name: Compass
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+permissions:
+  pull-requests: write
+  contents: read
+  statuses: write
+
+jobs:
+  compass:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -e .
+      - name: Run Compass
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          PROJECT_SLUG: metafore
+          COMPASS_URL: https://campass-btv.up.railway.app
+          COMPASS_API_KEY: ${{ secrets.COMPASS_API_KEY }}
+        run: python -m compass.action
+
+  auto-mark-on-merge:
+    if: github.event.action == 'closed' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST merge event to Compass webhook
+        env:
+          COMPASS_URL: https://campass-btv.up.railway.app
+          COMPASS_API_KEY: ${{ secrets.COMPASS_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          AUTHOR_EMAIL: ${{ github.event.pull_request.user.email }}
+        run: |
+          curl --fail-with-body --silent --show-error \
+            -X POST "${COMPASS_URL}/webhook/github" \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: ${COMPASS_API_KEY}" \
+            -H "X-GitHub-Token: ${GITHUB_TOKEN}" \
+            -d "{\"pr_number\":${PR_NUMBER},\"repo\":\"${REPO}\",\"sha\":\"${SHA}\",\"merged\":true,\"pr_author_email\":\"${AUTHOR_EMAIL}\"}"
