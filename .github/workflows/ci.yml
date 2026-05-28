@@ -41,6 +41,17 @@ jobs:
         # as of the commit that removed this skip flag.
         run: mvn package -B
 
+      - name: Notify Compass
+        if: always()
+        env:
+          COMPASS_API_KEY: ${{ secrets.compass_api_key_secret }}
+        run: |
+          curl -sf -X POST "https://app.usecompass.app/api/v1/ci/event" \
+            -H "Authorization: Bearer $COMPASS_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"repo\":\"$GITHUB_REPOSITORY\",\"sha\":\"$GITHUB_SHA\",\"ref\":\"$GITHUB_REF\",\"pr\":\"${{ github.event.pull_request.number }}\",\"status\":\"${{ job.status }}\"}" \
+            || echo "Compass notification skipped (secret not set)"
+
   build-and-deploy:
     needs: test
     if: github.ref == 'refs/heads/main'
