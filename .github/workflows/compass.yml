@@ -42,10 +42,11 @@ jobs:
           REPO: ${{ github.repository }}
           SHA: ${{ github.event.pull_request.head.sha }}
           AUTHOR_EMAIL: ${{ github.event.pull_request.user.email }}
+          AUTHOR_LOGIN: ${{ github.event.pull_request.user.login }}
         run: |
           curl --fail-with-body --silent --show-error \
             -X POST "${COMPASS_URL}/webhook/github" \
             -H "Content-Type: application/json" \
             -H "X-API-Key: ${COMPASS_API_KEY}" \
             -H "X-GitHub-Token: ${GITHUB_TOKEN}" \
-            -d "{\"pr_number\":${PR_NUMBER},\"repo\":\"${REPO}\",\"sha\":\"${SHA}\",\"merged\":true,\"pr_author_email\":\"${AUTHOR_EMAIL}\"}"
+            -d "{\"pr_number\":${PR_NUMBER},\"repo\":\"${REPO}\",\"sha\":\"${SHA}\",\"merged\":true,\"pr_author_email\":\"${AUTHOR_EMAIL}\",\"pr_author_login\":\"${AUTHOR_LOGIN}\"}"
