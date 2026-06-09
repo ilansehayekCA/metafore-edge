@@ -1,0 +1,111 @@
+name: Deploy engineer branch to their EKS (edge)
+
+# Every push to eng/<name> builds this branch's metafore-edge image and deploys
+# it to that engineer's <name>-dev cluster (edge tag = branch SHA; core/ui stay
+# at the stable baseline). Mirrors metafore-core's eng-branch-deploy.yml.
+#
+# Prereqs (one-time): <name>-dev cluster bootstrapped (eksctl +
+# metafore-platform/scripts/engineer-cluster-up.sh); the OIDC role
+# (secrets.AWS_ROLE_ARN) has an EKS access entry on each cluster + ECR push;
+# repo/org secrets GH_PAT, MCP_API_KEY, ANTHROPIC_API_KEY.
+on:
+  push:
+    branches:
+      - 'eng/**'
+
+concurrency:
+  group: eng-deploy-edge-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ECR_REGISTRY: 359469026479.dkr.ecr.us-east-1.amazonaws.com
+      AWS_REGION: us-east-1
+    steps:
+      - name: Derive engineer name, cluster, image tag from the branch
+        id: vars
+        run: |
+          NAME="${GITHUB_REF#refs/heads/eng/}"
+          NAME="${NAME//\//-}"
+          echo "name=$NAME"            >> "$GITHUB_OUTPUT"
+          echo "cluster=${NAME}-dev"   >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout metafore-edge
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Checkout metafore-platform (Helm chart)
+        uses: actions/checkout@v4
+        with:
+          repository: ilansehayekCA/metafore-platform
+          ref: main
+          path: _platform
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build + push the branch's edge image
+        run: |
+          IMG="$ECR_REGISTRY/metafore-ilan/metafore-edge:${{ steps.vars.outputs.tag }}"
+          docker build -t "$IMG" .
+          docker push "$IMG"
+
+      - name: Tooling (helm)
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+      - name: Install kubectl + dig
+        run: |
+          curl -sLO "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl"
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+          sudo apt-get update -y && sudo apt-get install -y dnsutils
+
+      - name: Point kubectl at the engineer's cluster
+        run: aws eks update-kubeconfig --name "${{ steps.vars.outputs.cluster }}" --region "$AWS_REGION"
+
+      - name: Resolve ingress NLB IP -> nip.io host
+        id: host
+        run: |
+          LB=$(kubectl get svc ingress-nginx-controller -n ingress-nginx \
+                 -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          IP=$(dig +short "$LB" | grep -E '^[0-9]+\.' | sort -V | head -1)
+          if [ -z "$IP" ]; then echo "::error::could not resolve NLB IP for $LB"; exit 1; fi
+          echo "host=${{ steps.vars.outputs.name }}.${IP}.nip.io" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy (helm upgrade --install — edge tag = branch, baseline otherwise)
+        run: |
+          helm upgrade --install metafore _platform/infra/helm/metafore-platform \
+            -n metafore --create-namespace \
+            --set createNamespace=false \
+            --set extraEdges.enabled=false \
+            --set emqx.externalBroker.enabled=false \
+            --set ingress.host="${{ steps.host.outputs.host }}" \
+            --set ingress.tls.enabled=true \
+            --set ingress.tls.clusterIssuer=letsencrypt-http01 \
+            --set edge.tag="${{ steps.vars.outputs.tag }}" \
+            --set core.env.MCP_API_KEY="${{ secrets.MCP_API_KEY }}" \
+            --set core.env.ANTHROPIC_API_KEY="${{ secrets.ANTHROPIC_API_KEY }}" \
+            --set neo4j.heapSize=512m --set neo4j.pageCacheSize=512m \
+            --set neo4j.memoryRequest=1Gi --set neo4j.memoryLimit=2Gi --set neo4j.cpuRequest=250m \
+            --timeout 12m
+          kubectl rollout status deploy/metafore-edge -n metafore --timeout=300s
+
+      - name: Summary
+        run: |
+          echo "### ✅ Deployed edge \`${{ steps.vars.outputs.tag }}\` to **${{ steps.vars.outputs.cluster }}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "🔗 https://${{ steps.host.outputs.host }}" >> "$GITHUB_STEP_SUMMARY"
