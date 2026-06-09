@@ -1,13 +1,9 @@
-name: Deploy engineer branch to their EKS (edge)
+name: Deploy engineer branch to their namespace (edge)
 
-# Every push to eng/<name> builds this branch's metafore-edge image and deploys
-# it to that engineer's <name>-dev cluster (edge tag = branch SHA; core/ui stay
-# at the stable baseline). Mirrors metafore-core's eng-branch-deploy.yml.
-#
-# Prereqs (one-time): <name>-dev cluster bootstrapped (eksctl +
-# metafore-platform/scripts/engineer-cluster-up.sh); the OIDC role
-# (secrets.AWS_ROLE_ARN) has an EKS access entry on each cluster + ECR push;
-# repo/org secrets GH_PAT, MCP_API_KEY, ANTHROPIC_API_KEY.
+# Push to eng/<name> builds this branch's metafore-edge image and deploys it
+# into the engineer's eng-<name> namespace on one shared cluster (edge tag =
+# branch SHA; core/ui stay at the stable baseline). Namespace model — one
+# cluster, many isolated environments. Mirrors metafore-core's workflow.
 on:
   push:
     branches:
@@ -26,14 +22,15 @@ jobs:
     env:
       ECR_REGISTRY: 359469026479.dkr.ecr.us-east-1.amazonaws.com
       AWS_REGION: us-east-1
+      SHARED_CLUSTER: metafore-preview
     steps:
-      - name: Derive engineer name, cluster, image tag from the branch
+      - name: Derive engineer name, namespace, image tag from the branch
         id: vars
         run: |
           NAME="${GITHUB_REF#refs/heads/eng/}"
           NAME="${NAME//\//-}"
           echo "name=$NAME"            >> "$GITHUB_OUTPUT"
-          echo "cluster=${NAME}-dev"   >> "$GITHUB_OUTPUT"
+          echo "ns=eng-${NAME}"        >> "$GITHUB_OUTPUT"
           echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout metafore-edge
@@ -75,8 +72,8 @@ jobs:
           sudo install -m 0755 kubectl /usr/local/bin/kubectl
           sudo apt-get update -y && sudo apt-get install -y dnsutils
 
-      - name: Point kubectl at the engineer's cluster
-        run: aws eks update-kubeconfig --name "${{ steps.vars.outputs.cluster }}" --region "$AWS_REGION"
+      - name: Point kubectl at the shared cluster
+        run: aws eks update-kubeconfig --name "$SHARED_CLUSTER" --region "$AWS_REGION"
 
       - name: Resolve ingress NLB IP -> nip.io host
         id: host
@@ -90,10 +87,11 @@ jobs:
       - name: Deploy (helm upgrade --install — edge tag = branch, baseline otherwise)
         run: |
           helm upgrade --install metafore _platform/infra/helm/metafore-platform \
-            -n metafore --create-namespace \
+            -n "${{ steps.vars.outputs.ns }}" --create-namespace \
             --set createNamespace=false \
             --set extraEdges.enabled=false \
             --set emqx.externalBroker.enabled=false \
+            --set isolation.enabled=true \
             --set ingress.host="${{ steps.host.outputs.host }}" \
             --set ingress.tls.enabled=true \
             --set ingress.tls.clusterIssuer=letsencrypt-http01 \
@@ -103,9 +101,9 @@ jobs:
             --set neo4j.heapSize=512m --set neo4j.pageCacheSize=512m \
             --set neo4j.memoryRequest=1Gi --set neo4j.memoryLimit=2Gi --set neo4j.cpuRequest=250m \
             --timeout 12m
-          kubectl rollout status deploy/metafore-edge -n metafore --timeout=300s
+          kubectl rollout status deploy/metafore-edge -n "${{ steps.vars.outputs.ns }}" --timeout=300s
 
       - name: Summary
         run: |
-          echo "### ✅ Deployed edge \`${{ steps.vars.outputs.tag }}\` to **${{ steps.vars.outputs.cluster }}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "### ✅ Deployed edge \`${{ steps.vars.outputs.tag }}\` to namespace **${{ steps.vars.outputs.ns }}** on **$SHARED_CLUSTER**" >> "$GITHUB_STEP_SUMMARY"
           echo "🔗 https://${{ steps.host.outputs.host }}" >> "$GITHUB_STEP_SUMMARY"
