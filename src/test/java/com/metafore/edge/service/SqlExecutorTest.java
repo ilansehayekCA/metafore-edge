@@ -452,6 +452,121 @@ class SqlExecutorTest {
         assertEquals("SELECT * FROM \"patients\"", sql);
     }
 
+    // ── ADR-077 — abstract-predicate pushdown ─────────────────────────
+
+    private static String buildReadSqlWhere(
+        String pattern, String table, String filterColumn,
+        boolean excludeTombstoned,
+        java.util.List<SqlExecutor.WhereCond> conds
+    ) {
+        return SqlExecutor.buildReadSql(
+            pattern, SqlExecutor.parseTableName(table),
+            java.util.Collections.emptyList(), filterColumn, 0,
+            excludeTombstoned, null, false, conds
+        );
+    }
+
+    @Test
+    void buildReadSqlRendersBetweenPredicateWithTombstoneGuard() {
+        // "patients born in 1950" → date BETWEEN ? AND ?, soft-delete-aware.
+        var conds = java.util.List.of(new SqlExecutor.WhereCond(
+            "date_of_birth", "between",
+            java.util.List.of("1950-01-01", "1950-12-31")));
+        String sql = buildReadSqlWhere("list", "patients", null, true, conds);
+        assertEquals(
+            "SELECT * FROM \"patients\" WHERE "
+            + "\"date_of_birth\" BETWEEN ? AND ? "
+            + "AND \"tombstoned_at\" IS NULL",
+            sql
+        );
+    }
+
+    @Test
+    void buildReadSqlAndJoinsMultipleScalarConditions() {
+        var conds = java.util.List.of(
+            new SqlExecutor.WhereCond("stage", "eq", "open"),
+            new SqlExecutor.WhereCond("amount", "gt", 100000));
+        String sql = buildReadSqlWhere("list", "deals", null, false, conds);
+        assertEquals(
+            "SELECT * FROM \"deals\" WHERE \"stage\" = ? AND \"amount\" > ?",
+            sql
+        );
+    }
+
+    @Test
+    void buildReadSqlComposesFkFilterThenPredicates() {
+        // FK filter clause is emitted first, then the predicate — bind
+        // order must follow (filter value, then predicate value).
+        var conds = java.util.List.of(
+            new SqlExecutor.WhereCond("status", "ne", "closed"));
+        String sql = buildReadSqlWhere("list", "tasks", "owner_id", false, conds);
+        assertEquals(
+            "SELECT * FROM \"tasks\" WHERE \"owner_id\" = ? "
+            + "AND \"status\" <> ?",
+            sql
+        );
+    }
+
+    @Test
+    void buildReadSqlRendersInAndIsNullAndContains() {
+        var conds = java.util.List.of(
+            new SqlExecutor.WhereCond("stage", "in",
+                java.util.List.of("a", "b", "c")),
+            new SqlExecutor.WhereCond("owner", "is_null", null),
+            new SqlExecutor.WhereCond("name", "contains", "lob"));
+        String sql = buildReadSqlWhere("list", "deals", null, false, conds);
+        assertEquals(
+            "SELECT * FROM \"deals\" WHERE \"stage\" IN (?, ?, ?) "
+            + "AND \"owner\" IS NULL AND \"name\" ILIKE ?",
+            sql
+        );
+    }
+
+    @Test
+    void parseWhereConditionsAcceptsFieldOrColumnKey() {
+        var raw = java.util.List.of(
+            java.util.Map.of("field", "dob", "op", "eq", "value", "x"));
+        var conds = SqlExecutor.parseWhereConditions(raw);
+        assertEquals(1, conds.size());
+        assertEquals("dob", conds.get(0).column);
+        assertEquals("eq", conds.get(0).op);
+    }
+
+    @Test
+    void parseWhereConditionsRejectsUnsupportedOp() {
+        var raw = java.util.List.of(
+            java.util.Map.of("field", "x", "op", "regex", "value", ".*"));
+        var ex = assertThrows(IllegalArgumentException.class,
+            () -> SqlExecutor.parseWhereConditions(raw));
+        assertTrue(ex.getMessage().contains("regex"));
+    }
+
+    @Test
+    void parseWhereConditionsRejectsBetweenWithWrongArity() {
+        var raw = java.util.List.of(java.util.Map.of(
+            "field", "dob", "op", "between",
+            "value", java.util.List.of("1950-01-01")));
+        assertThrows(IllegalArgumentException.class,
+            () -> SqlExecutor.parseWhereConditions(raw));
+    }
+
+    @Test
+    void collectWhereBindsFlattensInEmissionOrder() {
+        var conds = java.util.List.of(
+            new SqlExecutor.WhereCond("dob", "between",
+                java.util.List.of("1950-01-01", "1950-12-31")),
+            new SqlExecutor.WhereCond("stage", "in",
+                java.util.List.of("a", "b")),
+            new SqlExecutor.WhereCond("owner", "is_null", null),
+            new SqlExecutor.WhereCond("name", "contains", "lob"));
+        var binds = SqlExecutor.collectWhereBinds(conds);
+        assertEquals(
+            java.util.List.of(
+                "1950-01-01", "1950-12-31", "a", "b", "%lob%"),
+            binds
+        );
+    }
+
     @Test
     void buildReadSqlListExcludeTombstonedOnly() {
         String sql = SqlExecutor.buildReadSql(

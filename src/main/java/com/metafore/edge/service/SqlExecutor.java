@@ -867,6 +867,22 @@ public final class SqlExecutor {
                 "Missing or empty table_name");
         }
 
+        // ADR-077 — optional abstract-predicate pushdown. Parsed early so a
+        // malformed predicate or unsupported op fails before any DB contact.
+        // Supported for list/count only (filter semantics).
+        List<WhereCond> whereConds;
+        try {
+            whereConds = parseWhereConditions(payload.get("where_conditions"));
+        } catch (IllegalArgumentException e) {
+            return errorResult(start, "query", e.getMessage());
+        }
+        if (!whereConds.isEmpty()
+            && !("list".equals(pattern) || "count".equals(pattern))) {
+            return errorResult(start, "query",
+                "where_conditions is only supported for list/count patterns "
+                + "(got pattern=" + pattern + ")");
+        }
+
         // Phase 14.6 / A6 — parse once for the read path too.
         ParsedTableName parsedTable;
         try {
@@ -964,13 +980,17 @@ public final class SqlExecutor {
             // (skipped for count) + tombstoned_at when exclude_tombstoned
             // + keyset_field when in keyset mode.
             List<String> colsToValidate;
-            if ("count".equals(pattern) && !excludeTombstoned && !keysetMode) {
+            if ("count".equals(pattern) && !excludeTombstoned && !keysetMode
+                && whereConds.isEmpty()) {
                 colsToValidate = null;  // skip per-column check
             } else {
                 List<String> cv = new ArrayList<>();
                 if (!"count".equals(pattern)) cv.addAll(columns);
                 if (excludeTombstoned) cv.add("tombstoned_at");
                 if (keysetMode) cv.add(keysetField);
+                // ADR-077 — predicate columns must exist before we quote
+                // them into the WHERE clause.
+                for (WhereCond c : whereConds) cv.add(c.column);
                 colsToValidate = cv.isEmpty() ? null : cv;
             }
             String validationError = validateTableAndColumns(
@@ -996,6 +1016,12 @@ public final class SqlExecutor {
                 typeError = validateValueTypes(
                     java.util.Collections.emptyList(), keysetValue);
             }
+            if (typeError == null && !whereConds.isEmpty()) {
+                // ADR-077 — type-gate the flattened predicate binds (the
+                // same JSONB/array rejection set as filter/keyset values).
+                typeError = validateValueTypes(
+                    collectWhereBinds(whereConds), null);
+            }
             if (typeError != null) {
                 return errorResult(start, "query", typeError);
             }
@@ -1008,7 +1034,8 @@ public final class SqlExecutor {
                 filterValues != null ? filterValues.size() : 0,
                 excludeTombstoned,
                 keysetMode ? keysetField : null,
-                keysetMode && keysetValue != null
+                keysetMode && keysetValue != null,
+                whereConds
             );
 
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -1029,6 +1056,28 @@ public final class SqlExecutor {
                     && !filterColumn.isBlank()) {
                     String fcType = columnTypes.get(filterColumn);
                     bindValue(ps, idx++, filterValue, fcType);
+                }
+                // ADR-077 — bind predicate values AFTER the filter and
+                // BEFORE the LIMIT, matching renderWhereFragment order.
+                // Per-condition column type drives ISO date/timestamp
+                // coercion (e.g. "born in 1950" → date BETWEEN ? AND ?).
+                for (WhereCond c : whereConds) {
+                    String ct = columnTypes.get(c.column);
+                    if ("is_null".equals(c.op) || "is_not_null".equals(c.op)) {
+                        continue;
+                    } else if ("between".equals(c.op)) {
+                        List<?> lh = (List<?>) c.value;
+                        bindValue(ps, idx++, lh.get(0), ct);
+                        bindValue(ps, idx++, lh.get(1), ct);
+                    } else if ("in".equals(c.op) || "not_in".equals(c.op)) {
+                        for (Object el : (List<?>) c.value) {
+                            bindValue(ps, idx++, el, ct);
+                        }
+                    } else if ("contains".equals(c.op)) {
+                        bindValue(ps, idx++, "%" + c.value + "%", ct);
+                    } else {
+                        bindValue(ps, idx++, c.value, ct);
+                    }
                 }
                 if (keysetMode) {
                     // LIMIT placeholder gets limit+1 to derive has_more.
@@ -1126,6 +1175,156 @@ public final class SqlExecutor {
      * keyset_field=null (which short-circuits the keyset emission
      * branches so the output is identical to today's).
      */
+    // ── ADR-077 — abstract-predicate pushdown ─────────────────────────
+
+    /** Operators the edge can render as parameterized SQL. MUST match the
+     *  platform's abstract-predicate vocabulary (record_actions._WHERE_OPS).
+     *  Any op outside this set is rejected at executeParametricRead — the
+     *  edge never interpolates an unknown operator into SQL. */
+    static final Set<String> SUPPORTED_WHERE_OPS = Set.of(
+        "eq", "ne", "in", "not_in", "gt", "gte", "lt", "lte",
+        "between", "contains", "is_null", "is_not_null"
+    );
+
+    /** One parsed abstract-predicate condition for pushdown (ADR-077).
+     *  ``column`` is validated against INFORMATION_SCHEMA before any SQL is
+     *  built; ``value`` is bound via PreparedStatement — never interpolated.
+     *  ``value`` is a scalar (eq/ne/gt/…/contains), a 2-element list
+     *  (between), an N-element list (in/not_in), or null (is_null/
+     *  is_not_null). */
+    static final class WhereCond {
+        final String column;
+        final String op;
+        final Object value;
+
+        WhereCond(String column, String op, Object value) {
+            this.column = column;
+            this.op = op;
+            this.value = value;
+        }
+    }
+
+    /** Parse the optional ``where_conditions`` payload list into WhereCond
+     *  objects. Accepts ``column`` or ``field`` as the column key (the
+     *  platform's abstract predicate uses ``field``). Returns an empty list
+     *  when the payload is absent; throws IllegalArgumentException on a
+     *  malformed entry or unsupported op so executeParametricRead can
+     *  surface a clean error (never a half-built SQL string). */
+    @SuppressWarnings("unchecked")
+    static List<WhereCond> parseWhereConditions(Object raw) {
+        List<WhereCond> out = new ArrayList<>();
+        if (raw == null) return out;
+        if (!(raw instanceof List)) {
+            throw new IllegalArgumentException(
+                "where_conditions must be a list");
+        }
+        for (Object o : (List<Object>) raw) {
+            if (!(o instanceof Map)) {
+                throw new IllegalArgumentException(
+                    "where_conditions entry must be an object");
+            }
+            Map<String, Object> m = (Map<String, Object>) o;
+            Object colObj = m.containsKey("column")
+                ? m.get("column") : m.get("field");
+            String column = colObj == null ? null : colObj.toString();
+            String op = m.get("op") == null ? null : m.get("op").toString();
+            if (column == null || column.isBlank()) {
+                throw new IllegalArgumentException(
+                    "where condition missing column/field");
+            }
+            if (op == null || !SUPPORTED_WHERE_OPS.contains(op)) {
+                throw new IllegalArgumentException(
+                    "unsupported where op: " + op);
+            }
+            Object value = m.get("value");
+            if (("in".equals(op) || "not_in".equals(op))) {
+                if (!(value instanceof List)
+                    || ((List<?>) value).isEmpty()) {
+                    throw new IllegalArgumentException(
+                        op + " requires a non-empty value list");
+                }
+            } else if ("between".equals(op)) {
+                if (!(value instanceof List)
+                    || ((List<?>) value).size() != 2) {
+                    throw new IllegalArgumentException(
+                        "between requires a [low, high] value list");
+                }
+            } else if (!"is_null".equals(op) && !"is_not_null".equals(op)
+                && value == null) {
+                throw new IllegalArgumentException(
+                    op + " requires a value");
+            }
+            out.add(new WhereCond(column, op, value));
+        }
+        return out;
+    }
+
+    /** Render one WhereCond as a parameterized SQL fragment (column quoted,
+     *  values as ``?`` placeholders). Bind order is the order returned by
+     *  {@link #collectWhereBinds}. */
+    static String renderWhereFragment(WhereCond c) {
+        String col = "\"" + c.column + "\"";
+        switch (c.op) {
+            case "eq":       return col + " = ?";
+            case "ne":       return col + " <> ?";
+            case "gt":       return col + " > ?";
+            case "gte":      return col + " >= ?";
+            case "lt":       return col + " < ?";
+            case "lte":      return col + " <= ?";
+            case "between":  return col + " BETWEEN ? AND ?";
+            case "contains": return col + " ILIKE ?";
+            case "is_null":     return col + " IS NULL";
+            case "is_not_null": return col + " IS NOT NULL";
+            case "in":
+            case "not_in": {
+                int n = ((List<?>) c.value).size();
+                StringBuilder sb = new StringBuilder(col);
+                sb.append("not_in".equals(c.op) ? " NOT IN (" : " IN (");
+                for (int i = 0; i < n; i++) {
+                    if (i > 0) sb.append(", ");
+                    sb.append('?');
+                }
+                sb.append(')');
+                return sb.toString();
+            }
+            default:
+                // Unreachable: parseWhereConditions allowlists ops.
+                throw new IllegalArgumentException(
+                    "unsupported where op: " + c.op);
+        }
+    }
+
+    /** Ordered scalar bind values for a WhereCond list, matching the
+     *  emission order of {@link #renderWhereFragment}. is_null/is_not_null
+     *  contribute none; between contributes [low, high]; in/not_in
+     *  contribute each element; contains contributes the %-wrapped term;
+     *  everything else contributes the single value. Used both for the
+     *  pre-flight type gate and for the actual bind loop. */
+    static List<Object> collectWhereBinds(List<WhereCond> conds) {
+        List<Object> binds = new ArrayList<>();
+        for (WhereCond c : conds) {
+            switch (c.op) {
+                case "is_null":
+                case "is_not_null":
+                    break;
+                case "between":
+                    binds.add(((List<?>) c.value).get(0));
+                    binds.add(((List<?>) c.value).get(1));
+                    break;
+                case "in":
+                case "not_in":
+                    binds.addAll((List<Object>) c.value);
+                    break;
+                case "contains":
+                    binds.add("%" + c.value + "%");
+                    break;
+                default:
+                    binds.add(c.value);
+            }
+        }
+        return binds;
+    }
+
     static String buildReadSql(
         String pattern, String tableName, List<String> columns,
         String filterColumn, int filterValuesCount,
@@ -1186,6 +1385,28 @@ public final class SqlExecutor {
         boolean excludeTombstoned,
         String keysetField, boolean keysetValuePresent
     ) {
+        return buildReadSql(pattern, parsed, columns, filterColumn,
+            filterValuesCount, excludeTombstoned, keysetField,
+            keysetValuePresent, java.util.Collections.emptyList());
+    }
+
+    /**
+     * ADR-077 — read-SQL builder with optional abstract-predicate pushdown.
+     *
+     * ``whereConds`` (may be empty) are AND-joined parameterized fragments
+     * emitted AFTER the pattern's filter clause and BEFORE the tombstone
+     * guard, so the bind order in executeParametricRead lines up:
+     * keyset comparator → filter value(s) → where-condition value(s) →
+     * LIMIT. Columns are validated against INFORMATION_SCHEMA upstream;
+     * values are bound, never interpolated.
+     */
+    static String buildReadSql(
+        String pattern, ParsedTableName parsed, List<String> columns,
+        String filterColumn, int filterValuesCount,
+        boolean excludeTombstoned,
+        String keysetField, boolean keysetValuePresent,
+        List<WhereCond> whereConds
+    ) {
         boolean keysetMode = keysetField != null && !keysetField.isBlank();
 
         // Projection.
@@ -1228,6 +1449,13 @@ public final class SqlExecutor {
         } else if (("list".equals(pattern) || "count".equals(pattern))
             && filterColumn != null && !filterColumn.isBlank()) {
             whereClauses.add("\"" + filterColumn + "\" = ?");
+        }
+        // ADR-077 — abstract-predicate pushdown fragments. Emitted after the
+        // pattern filter, so bind order = keyset → filter → where-conds.
+        if (whereConds != null) {
+            for (WhereCond c : whereConds) {
+                whereClauses.add(renderWhereFragment(c));
+            }
         }
         if (excludeTombstoned) {
             whereClauses.add("\"tombstoned_at\" IS NULL");
