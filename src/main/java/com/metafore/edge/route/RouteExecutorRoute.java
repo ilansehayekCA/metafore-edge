@@ -155,13 +155,18 @@ public class RouteExecutorRoute extends RouteBuilder {
         }
 
         // Slice 33.1.0 dispatch — parametric vs legacy SQL.
-        // ``operation`` keys the new parametric path
+        // ``operation`` keys the only supported path
         // (PreparedStatement, INFORMATION_SCHEMA validation,
-        // type-supported gate). ``sql`` keys the legacy
-        // string-substitution path (kept for rolling-window
-        // compatibility with cores that haven't flipped yet).
-        // Explicit handling for both ambiguous and missing
-        // payloads — defense-in-depth at the dispatch boundary.
+        // type-supported gate).
+        //
+        // security(adr-096): the legacy ``sql`` string-substitution path
+        // is RETIRED. A payload carrying a raw ``sql`` key (the former
+        // injection surface — unescaped ${param} interpolation executed
+        // via a plain Statement) is now rejected with a structured
+        // ``unsupported_payload`` envelope instead of being executed. The
+        // edge accepts ONLY the parametric ``operation`` payload. We still
+        // classify the shape so the rejection message is specific, but no
+        // raw-SQL command can reach the database.
         String legacySql = params != null ? (String) params.get("sql") : null;
         if (legacySql == null && routeYaml != null) {
             legacySql = extractQuery(routeYaml);
@@ -172,17 +177,29 @@ public class RouteExecutorRoute extends RouteBuilder {
                 return MessageFactory.routeResult(config, routeId,
                     "error", null, 0, null, null, null,
                     "Ambiguous payload: both 'operation' (parametric) "
-                    + "and 'sql' (legacy) present. Send exactly one.",
+                    + "and 'sql' (legacy) present. Send only 'operation'.",
                     null);
             case MISSING:
                 return MessageFactory.routeResult(config, routeId,
                     "error", null, 0, null, null, null,
-                    "Missing 'operation' (parametric path) or 'sql' "
-                    + "(legacy path) in route parameters", null);
+                    "Missing 'operation' (parametric path) in route "
+                    + "parameters", null);
             case PARAMETRIC:
                 return executeParametric(routeId, params);
             case LEGACY:
-                return executeSql(routeId, legacySql, params);
+                // security(adr-096): retired raw-SQL path. Fail closed —
+                // never route an unescaped ${param}-substituted string to
+                // the database. Structured 'unsupported_payload' so core's
+                // response handler can audit + surface without parsing
+                // free text.
+                return MessageFactory.routeResult(config, routeId,
+                    "rejected", "query", 0, null, null, null,
+                    "unsupported_payload",
+                    "Legacy raw 'sql' payloads are no longer accepted. "
+                    + "Send a parametric 'operation' "
+                    + "(create/update/delete/select/read) payload. "
+                    + "The unescaped string-substitution SQL path was "
+                    + "retired (adr-096).");
             default:
                 throw new IllegalStateException("PayloadKind: " + kind);
         }
@@ -320,35 +337,13 @@ public class RouteExecutorRoute extends RouteBuilder {
             status, "shell", latency, null, null, data, error, null);
     }
 
-    @SuppressWarnings("unchecked")
-    private Map<String, Object> executeSql(String routeId, String sql,
-                                            Map<String, Object> params) {
-        sql = SqlExecutor.substituteParams(sql, params);
-
-        if (!SqlExecutor.isAllowed(sql)) {
-            return MessageFactory.routeResult(config, routeId,
-                "rejected", "query", 0, null, null, null,
-                "Query not in whitelist: " + sql.substring(0, Math.min(30, sql.length())), null);
-        }
-
-        DataSource ds = dsRegistry.get(routeId);
-        if (ds == null) {
-            return MessageFactory.routeResult(config, routeId,
-                "error", "query", 0, null, null, null,
-                "No database connection available", null);
-        }
-
-        Map<String, Object> execResult = SqlExecutor.execute(ds, sql);
-        String status = (String) execResult.get("status");
-        String action = (String) execResult.get("action");
-        long latency = ((Number) execResult.get("latency_ms")).longValue();
-        Integer rowCount = (Integer) execResult.get("row_count");
-        Integer rowsAffected = (Integer) execResult.get("rows_affected");
-        List<Map<String, Object>> data = (List<Map<String, Object>>) execResult.get("data");
-        String error = (String) execResult.get("error");
-        return MessageFactory.routeResult(config, routeId,
-            status, action, latency, rowCount, rowsAffected, data, error, null);
-    }
+    // security(adr-096): the legacy executeSql(...) helper — which called
+    // SqlExecutor.substituteParams (unescaped ${param} interpolation) and
+    // then SqlExecutor.execute(ds, rawSql) via a plain Statement — has been
+    // removed. The dispatch boundary (handleExecute) now rejects any raw
+    // 'sql' payload with an 'unsupported_payload' envelope; only the
+    // parametric PreparedStatement path (executeParametric / executeRead)
+    // can reach the database.
 
     /**
      * Phase 14.12 / MTBC.T1 — handle a {@code connect_and_ping} verb.

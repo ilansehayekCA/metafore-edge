@@ -168,17 +168,16 @@ public final class SqlExecutor {
         return ALLOWED_SQL_PREFIXES.stream().anyMatch(upper::startsWith);
     }
 
-    public static String substituteParams(String sql, Map<String, Object> params) {
-        if (sql == null || params == null) return sql;
-        String result = sql;
-        for (Map.Entry<String, Object> entry : params.entrySet()) {
-            String placeholder = "${" + entry.getKey() + "}";
-            if (result.contains(placeholder)) {
-                result = result.replace(placeholder, String.valueOf(entry.getValue()));
-            }
-        }
-        return result;
-    }
+    // security(adr-096): substituteParams(...) — the unescaped
+    // ``result.replace("${"+key+"}", String.valueOf(value))`` string
+    // interpolation that fed the raw-Statement execute(...) path — has
+    // been REMOVED. It was the SQL-injection surface: a param value
+    // containing quotes / semicolons / SQL syntax was spliced directly
+    // into the SQL text with no escaping, then run via a plain Statement.
+    // All SQL now flows through the parametric PreparedStatement path
+    // (executeParametric / executeParametricRead), which binds values and
+    // never interpolates them. The dispatch boundary in RouteExecutorRoute
+    // rejects any raw ``sql`` payload before it can reach the database.
 
     /**
      * Slice 33.1.0 — parametric CRUD execution via JDBC PreparedStatement.
@@ -1478,48 +1477,12 @@ public final class SqlExecutor {
         return sql.toString();
     }
 
-    public static Map<String, Object> execute(DataSource ds, String sql) {
-        Map<String, Object> result = new LinkedHashMap<>();
-        long start = System.currentTimeMillis();
-
-        String upper = sql.trim().toUpperCase();
-        boolean isRead = upper.startsWith("SELECT") || upper.startsWith("SHOW");
-
-        try (Connection conn = ds.getConnection();
-             Statement stmt = conn.createStatement()) {
-
-            if (isRead) {
-                try (ResultSet rs = stmt.executeQuery(sql)) {
-                    ResultSetMetaData meta = rs.getMetaData();
-                    int cols = meta.getColumnCount();
-                    List<Map<String, Object>> rows = new ArrayList<>();
-                    while (rs.next() && rows.size() < MAX_ROWS) {
-                        Map<String, Object> row = new LinkedHashMap<>();
-                        for (int i = 1; i <= cols; i++) {
-                            Object val = rs.getObject(i);
-                            row.put(meta.getColumnLabel(i), val != null ? val.toString() : null);
-                        }
-                        rows.add(row);
-                    }
-                    result.put("status", "success");
-                    result.put("action", "query");
-                    result.put("latency_ms", System.currentTimeMillis() - start);
-                    result.put("row_count", rows.size());
-                    result.put("data", rows);
-                }
-            } else {
-                int affected = stmt.executeUpdate(sql);
-                result.put("status", "success");
-                result.put("action", "execute");
-                result.put("latency_ms", System.currentTimeMillis() - start);
-                result.put("rows_affected", affected);
-            }
-        } catch (SQLException e) {
-            result.put("status", "error");
-            result.put("action", isRead ? "query" : "execute");
-            result.put("latency_ms", System.currentTimeMillis() - start);
-            result.put("error", e.getMessage());
-        }
-        return result;
-    }
+    // security(adr-096): execute(DataSource, String) — which ran an
+    // arbitrary caller-supplied SQL string via a plain JDBC ``Statement``
+    // (no bind parameters) — has been REMOVED. Combined with the now-gone
+    // substituteParams, this was the unescaped raw-SQL execution surface.
+    // The edge no longer executes any free-form SQL string. Every database
+    // operation goes through executeParametric / executeParametricRead,
+    // which validate table + column existence against INFORMATION_SCHEMA
+    // and bind every value via PreparedStatement.
 }

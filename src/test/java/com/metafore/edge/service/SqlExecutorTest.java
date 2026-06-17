@@ -46,27 +46,12 @@ class SqlExecutorTest {
         assertFalse(SqlExecutor.isAllowed("   "));
     }
 
-    @Test
-    void parameterSubstitution() {
-        String sql = "SELECT * FROM users WHERE id = ${id} AND name = '${name}'";
-        Map<String, Object> params = Map.of("id", 42, "name", "alice");
-        String result = SqlExecutor.substituteParams(sql, params);
-        assertEquals("SELECT * FROM users WHERE id = 42 AND name = 'alice'", result);
-    }
-
-    @Test
-    void parameterSubstitutionNoParams() {
-        String sql = "SELECT 1";
-        assertEquals(sql, SqlExecutor.substituteParams(sql, null));
-        assertEquals(sql, SqlExecutor.substituteParams(sql, Map.of()));
-    }
-
-    @Test
-    void parameterSubstitutionMissingParam() {
-        String sql = "SELECT * FROM t WHERE id = ${id}";
-        String result = SqlExecutor.substituteParams(sql, Map.of("other", "val"));
-        assertEquals(sql, result);
-    }
+    // security(adr-096): the parameterSubstitution* tests covered the
+    // retired SqlExecutor.substituteParams(...) unescaped string-
+    // interpolation path. That method (and the raw execute(ds, sql)
+    // Statement path it fed) has been removed — the edge now binds every
+    // value via PreparedStatement (executeParametric / executeParametricRead),
+    // so there is no string-substitution behavior left to assert.
 
     // ── Slice 33.1.0 — parametric CRUD coverage ─────────────────────
 
