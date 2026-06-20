@@ -21,6 +21,36 @@ public final class DataSourceRegistry {
      */
     public static final int DEFAULT_ROW_FETCH_SIZE = 500;
 
+    /**
+     * Bounded execution timeouts on every managed connection — write-path
+     * hang fix.
+     *
+     * Without these, a parametric INSERT/UPDATE that blocks on a row/table
+     * lock calls {@code PreparedStatement.executeUpdate()} with no bound and
+     * hangs forever: the edge never publishes a route-result, core's write
+     * dispatch waits, and the MCP transport idle-closes the socket
+     * ("socket connection closed unexpectedly", 0 rows written). SELECT
+     * reads don't contend for write locks, which is exactly why the read
+     * path stayed healthy while writes were dead.
+     *
+     * - {@code statement_timeout} bounds total statement runtime.
+     * - {@code lock_timeout} bounds how long a statement waits to ACQUIRE a
+     *   lock, so a blocked write fails fast with a typed {@link
+     *   java.sql.SQLException} ("canceling statement due to lock timeout")
+     *   which {@code SqlExecutor.executeParametric} catches and turns into a
+     *   published {@code errorResult} — core gets a clean error instead of a
+     *   hang.
+     * - {@code socketTimeout} is a network-level backstop set above
+     *   {@code statement_timeout} so the server-side timeout fires first
+     *   with a clean PG message rather than an opaque socket reset.
+     *
+     * Values are sized just inside core's {@code crud_camel_timeout_seconds}
+     * (30s) so the edge fails within the dispatch window, not after it.
+     */
+    public static final int STATEMENT_TIMEOUT_MS = 30_000;
+    public static final int LOCK_TIMEOUT_MS = 15_000;
+    public static final int SOCKET_TIMEOUT_SECONDS = 45;
+
     private final ConcurrentHashMap<String, DataSource> dataSources = new ConcurrentHashMap<>();
     private final CamelContext camelContext;
 
@@ -60,6 +90,16 @@ public final class DataSourceRegistry {
                 ? defaultRowFetchSize
                 : DEFAULT_ROW_FETCH_SIZE;
             ds.setDefaultRowFetchSize(effectiveFetchSize);
+            // Write-path hang fix — bound statement + lock-wait time so a
+            // parametric write blocked on a lock fails fast with a typed
+            // SQLException (caught -> errorResult -> published to core)
+            // instead of hanging executeUpdate() forever. See the field
+            // docs above. statement_timeout/lock_timeout are server-side
+            // (GUCs via the startup ``options`` packet); socketTimeout is a
+            // client-side network backstop.
+            ds.setOptions("-c statement_timeout=" + STATEMENT_TIMEOUT_MS
+                + " -c lock_timeout=" + LOCK_TIMEOUT_MS);
+            ds.setSocketTimeout(SOCKET_TIMEOUT_SECONDS);
             String url = "jdbc:postgresql://" + host + ":" + port
                 + (dbName != null && !dbName.isEmpty() ? "/" + dbName : "");
             dataSources.put(name, ds);
