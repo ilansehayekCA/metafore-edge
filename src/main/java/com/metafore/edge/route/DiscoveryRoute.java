@@ -54,6 +54,20 @@ public class DiscoveryRoute extends RouteBuilder {
                 Map<String, Object> scope = (Map<String, Object>)
                     cmd.getOrDefault("scope", DiscoveryService.defaultScope());
                 String trigger = (String) cmd.getOrDefault("trigger", "remote");
+                // Core's discover_and_wait subscribes to and blocks on the
+                // response_topic it sent in the command
+                // (response/{correlation_id}). Echo the result there so the
+                // synchronous discover API / Atlas "Discover" button resolves
+                // instead of always timing out. We still publish to the fixed
+                // telemetry/.../discovery topic below so core's async
+                // _handle_discovery keeps updating the graph. When no
+                // response_topic is present (startup discovery / legacy
+                // cores) only the telemetry publish happens — unchanged.
+                Object responseTopic = cmd.get("response_topic");
+                if (responseTopic instanceof String
+                    && !((String) responseTopic).isBlank()) {
+                    exchange.getIn().setHeader("mfResponseTopic", responseTopic);
+                }
                 Map<String, Object> capabilities =
                     DiscoveryService.execute(config.controllerId(), scope);
                 exchange.getIn().setBody(MessageFactory.discoveryResult(
@@ -62,6 +76,14 @@ public class DiscoveryRoute extends RouteBuilder {
             .marshal().json()
             .to("paho:" + topics.telemetryDiscovery()
                 + "?brokerUrl=" + config.brokerUrl())
+            // Discover correlation fix — also deliver to the command's
+            // response_topic so core's discover_and_wait
+            // (response/{correlation_id}) resolves instead of timing out.
+            .choice()
+                .when(header("mfResponseTopic").isNotNull())
+                    .toD("paho:${header.mfResponseTopic}"
+                        + "?brokerUrl=" + config.brokerUrl())
+            .end()
             .log("Discovery results published");
     }
 }
