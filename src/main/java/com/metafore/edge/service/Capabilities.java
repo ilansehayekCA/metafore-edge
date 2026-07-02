@@ -45,7 +45,8 @@ public final class Capabilities {
             "introspect",
             "read",
             "write",
-            "ddl"
+            "ddl",
+            "mcp"
         ))
     );
 
@@ -105,6 +106,13 @@ public final class Capabilities {
 
     private static String deriveForExecute(Map<String, Object> params) {
         if (params != null) {
+            // adr-158 — MCP transport is keyed on mcp_tool presence and
+            // takes precedence over the SQL/shell classification (an MCP
+            // command carries neither shell_command nor operation).
+            Object mcpTool = params.get("mcp_tool");
+            if (mcpTool instanceof String && !((String) mcpTool).isBlank()) {
+                return "mcp";
+            }
             Object shellCmd = params.get("shell_command");
             if (shellCmd instanceof String && !((String) shellCmd).isBlank()) {
                 return "shell";

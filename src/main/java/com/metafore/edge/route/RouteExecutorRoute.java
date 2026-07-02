@@ -5,6 +5,7 @@ import com.metafore.edge.message.MessageFactory;
 import com.metafore.edge.service.Capabilities;
 import com.metafore.edge.service.ConnectionTester;
 import com.metafore.edge.service.DataSourceRegistry;
+import com.metafore.edge.service.McpExecutor;
 import com.metafore.edge.service.ShellExecutor;
 import com.metafore.edge.service.SqlExecutor;
 import com.metafore.edge.topic.TopicBuilder;
@@ -18,12 +19,24 @@ public class RouteExecutorRoute extends RouteBuilder {
     private final EdgeConfig config;
     private final TopicBuilder topics;
     private final DataSourceRegistry dsRegistry;
+    private final McpExecutor mcpExecutor;
 
     public RouteExecutorRoute(EdgeConfig config, TopicBuilder topics,
                               DataSourceRegistry dsRegistry) {
+        this(config, topics, dsRegistry, new McpExecutor());
+    }
+
+    /**
+     * adr-158 — test-friendly constructor accepting a pre-built
+     * {@link McpExecutor} (wrapping a mock HttpClient) so the MCP
+     * dispatch branch is exercised without a live MCP server.
+     */
+    RouteExecutorRoute(EdgeConfig config, TopicBuilder topics,
+                       DataSourceRegistry dsRegistry, McpExecutor mcpExecutor) {
         this.config = config;
         this.topics = topics;
         this.dsRegistry = dsRegistry;
+        this.mcpExecutor = mcpExecutor;
     }
 
     @Override
@@ -133,6 +146,15 @@ public class RouteExecutorRoute extends RouteBuilder {
         Map<String, Object> params = (Map<String, Object>)
             cmd.getOrDefault("parameters", Collections.emptyMap());
         String routeYaml = (String) cmd.getOrDefault("route_yaml", "");
+
+        // adr-158 — MCP transport. Keyed on mcp_tool presence; executes a
+        // JSON-RPC tool call against an MCP-native system with credentials
+        // (mcp_token) local to the controller. Checked before the DB /
+        // shell / SQL branches because an MCP command carries none of
+        // db_host / shell_command / operation.
+        if (McpExecutor.isMcpCommand(params)) {
+            return executeMcp(routeId, params);
+        }
 
         // Register DataSource if DB params present
         if (params.containsKey("db_host") || params.containsKey("DB_HOST")) {
@@ -319,6 +341,27 @@ public class RouteExecutorRoute extends RouteBuilder {
         String error = (String) execResult.get("error");
         return MessageFactory.routeResult(config, routeId,
             status, action, latency, rowCount, null, data, error, null);
+    }
+
+    /**
+     * adr-158 — dispatch an MCP tool call to {@link McpExecutor} and wrap
+     * its partial result into the standard route-result envelope
+     * ({@code action="mcp"}). Credentials (mcp_token) arrive in-band on
+     * the route command and never leave the controller.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> executeMcp(String routeId, Map<String, Object> params) {
+        Map<String, Object> execResult = mcpExecutor.execute(params);
+        String status = (String) execResult.get("status");
+        String action = (String) execResult.getOrDefault("action", "mcp");
+        long latency = ((Number) execResult.getOrDefault("latency_ms", 0L)).longValue();
+        Integer rowCount = (Integer) execResult.get("row_count");
+        List<Map<String, Object>> data =
+            (List<Map<String, Object>>) execResult.get("data");
+        String error = (String) execResult.get("error");
+        String errorDetails = (String) execResult.get("error_details");
+        return MessageFactory.routeResult(config, routeId,
+            status, action, latency, rowCount, null, data, error, errorDetails);
     }
 
     private Map<String, Object> executeShell(String routeId, String command) {

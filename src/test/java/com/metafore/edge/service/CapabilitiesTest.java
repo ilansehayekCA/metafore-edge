@@ -24,6 +24,7 @@ class CapabilitiesTest {
         assertTrue(Capabilities.DECLARED.contains("read"));
         assertTrue(Capabilities.DECLARED.contains("write"));
         assertTrue(Capabilities.DECLARED.contains("ddl"));
+        assertTrue(Capabilities.DECLARED.contains("mcp"));  // adr-158
         assertFalse(Capabilities.DECLARED.contains("sync"));
         // Legacy transport-flavor strings must not leak.
         assertFalse(Capabilities.DECLARED.contains("jdbc"));
@@ -93,6 +94,32 @@ class CapabilitiesTest {
                 "operation=" + op
             );
         }
+    }
+
+    @Test
+    void mcpToolMapsToMcp() {
+        // adr-158 — mcp_tool presence selects the MCP transport, taking
+        // precedence over shell/operation classification.
+        Map<String, Object> p = new HashMap<>();
+        p.put("mcp_tool", "get_roadmap");
+        assertEquals(
+            "mcp",
+            Capabilities.deriveRequiredCapability("execute", p)
+        );
+        assertEquals(
+            "mcp",
+            Capabilities.deriveRequiredCapability("deploy", p)
+        );
+    }
+
+    @Test
+    void blankMcpToolFallsThroughToWrite() {
+        Map<String, Object> p = new HashMap<>();
+        p.put("mcp_tool", "  ");
+        assertEquals(
+            "write",
+            Capabilities.deriveRequiredCapability("execute", p)
+        );
     }
 
     @Test
