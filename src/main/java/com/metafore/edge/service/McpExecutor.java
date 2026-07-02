@@ -117,12 +117,12 @@ public final class McpExecutor {
             return err(start, "invalid_mcp_command",
                 "Missing 'mcp_server_url' for MCP transport '" + transport + "'.");
         }
-        String token = str(params, "mcp_token", "");
+        Map<String, String> reqHeaders = buildHeaders(params);
 
         try {
             // 1. initialize — negotiate + capture session id.
             ObjectNode initReq = jsonRpc(1, "initialize", initParams());
-            HttpResponse<String> initResp = post(serverUrl, token, null, initReq);
+            HttpResponse<String> initResp = post(serverUrl, reqHeaders, null, initReq);
             String sessionId = header(initResp, "Mcp-Session-Id");
             JsonNode initResult = extractResult(initResp, 1);
             if (initResult == null) {
@@ -135,14 +135,14 @@ public final class McpExecutor {
             ObjectNode initedNote = MAPPER.createObjectNode();
             initedNote.put("jsonrpc", "2.0");
             initedNote.put("method", "notifications/initialized");
-            post(serverUrl, token, sessionId, initedNote);
+            post(serverUrl, reqHeaders, sessionId, initedNote);
 
             // 3. tools/call.
             ObjectNode callParams = MAPPER.createObjectNode();
             callParams.put("name", tool);
             callParams.set("arguments", MAPPER.valueToTree(arguments));
             ObjectNode callReq = jsonRpc(2, "tools/call", callParams);
-            HttpResponse<String> callResp = post(serverUrl, token, sessionId, callReq);
+            HttpResponse<String> callResp = post(serverUrl, reqHeaders, sessionId, callReq);
 
             JsonNode error = extractError(callResp, 2);
             if (error != null) {
@@ -206,8 +206,35 @@ public final class McpExecutor {
         return req;
     }
 
+    /**
+     * Assemble the per-request auth/routing headers. Supports arbitrary
+     * custom headers via {@code mcp_headers} (e.g. Compass needs
+     * {@code X-API-Key} + {@code X-Project} — it does NOT use a bearer
+     * token), plus the {@code mcp_token} convenience which becomes
+     * {@code Authorization: Bearer <token>} unless an Authorization
+     * header was already supplied in {@code mcp_headers}.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, String> buildHeaders(Map<String, Object> params) {
+        Map<String, String> headers = new LinkedHashMap<>();
+        Object raw = params.get("mcp_headers");
+        if (raw instanceof Map) {
+            for (Map.Entry<?, ?> e : ((Map<?, ?>) raw).entrySet()) {
+                if (e.getKey() != null && e.getValue() != null) {
+                    headers.put(String.valueOf(e.getKey()), String.valueOf(e.getValue()));
+                }
+            }
+        }
+        String token = str(params, "mcp_token", "");
+        if (!token.isBlank()
+            && headers.keySet().stream().noneMatch(k -> k.equalsIgnoreCase("authorization"))) {
+            headers.put("Authorization", "Bearer " + token);
+        }
+        return headers;
+    }
+
     private HttpResponse<String> post(
-        String url, String token, String sessionId, JsonNode body
+        String url, Map<String, String> extraHeaders, String sessionId, JsonNode body
     ) throws Exception {
         HttpRequest.Builder b = HttpRequest.newBuilder()
             .uri(URI.create(url))
@@ -215,8 +242,10 @@ public final class McpExecutor {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
             .header("MCP-Protocol-Version", PROTOCOL_VERSION);
-        if (token != null && !token.isBlank()) {
-            b.header("Authorization", "Bearer " + token);
+        if (extraHeaders != null) {
+            for (Map.Entry<String, String> h : extraHeaders.entrySet()) {
+                b.header(h.getKey(), h.getValue());
+            }
         }
         if (sessionId != null && !sessionId.isBlank()) {
             b.header("Mcp-Session-Id", sessionId);

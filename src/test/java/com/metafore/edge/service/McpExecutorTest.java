@@ -85,6 +85,55 @@ class McpExecutorTest {
     }
 
     @Test
+    void customHeadersAppliedOnEveryRequest() {
+        // Compass shape: X-API-Key + X-Project, no bearer token.
+        String callBody =
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{"
+            + "\"type\":\"text\",\"text\":\"{\\\"ok\\\":true}\"}]}}";
+        ScriptedHttpClient client = new ScriptedHttpClient(
+            resp(200, "application/json", "s1", INIT_BODY),
+            resp(202, "application/json", null, ""),
+            resp(200, "application/json", null, callBody));
+
+        Map<String, Object> p = new LinkedHashMap<>();
+        p.put("mcp_server_url", "https://campass-btv.up.railway.app/mcp/");
+        p.put("mcp_transport", "http");
+        p.put("mcp_tool", "manage_features");
+        p.put("mcp_arguments", Map.of("operation", "list"));
+        p.put("mcp_headers", Map.of("X-API-Key", "cmps-xxx", "X-Project", "metafore"));
+
+        Map<String, Object> r = new McpExecutor(client).execute(p);
+
+        assertEquals("success", r.get("status"));
+        // Custom headers applied on initialize (0), notification (1), call (2).
+        for (int i = 0; i < 3; i++) {
+            assertEquals("cmps-xxx", client.sentHeader(i, "X-API-Key"), "req " + i);
+            assertEquals("metafore", client.sentHeader(i, "X-Project"), "req " + i);
+        }
+        // No bearer token supplied → no Authorization header.
+        assertNull(client.sentAuth(2));
+    }
+
+    @Test
+    void explicitAuthorizationHeaderWinsOverToken() {
+        String callBody =
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{"
+            + "\"type\":\"text\",\"text\":\"{\\\"ok\\\":true}\"}]}}";
+        ScriptedHttpClient client = new ScriptedHttpClient(
+            resp(200, "application/json", "s1", INIT_BODY),
+            resp(202, "application/json", null, ""),
+            resp(200, "application/json", null, callBody));
+
+        Map<String, Object> p = mcpCmd("get_context");        // carries mcp_token=tok-123
+        p.put("mcp_headers", Map.of("Authorization", "Custom keep-me"));
+
+        new McpExecutor(client).execute(p);
+
+        // mcp_headers Authorization must not be overwritten by the token.
+        assertEquals("Custom keep-me", client.sentHeader(2, "Authorization"));
+    }
+
+    @Test
     void structuredContentPreferredOverText() {
         String callBody =
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{"
@@ -272,14 +321,20 @@ class McpExecutorTest {
             this.script = new ArrayList<>(Arrays.asList(stubs));
         }
 
+        private final List<HttpRequest> sentRequests = new ArrayList<>();
+
         int sendCount() { return idx; }
         String sentSession(int i) { return sentSessions.get(i); }
         String sentAuth(int i) { return sentAuths.get(i); }
+        String sentHeader(int i, String name) {
+            return sentRequests.get(i).headers().firstValue(name).orElse(null);
+        }
 
         @Override
         @SuppressWarnings("unchecked")
         public <T> HttpResponse<T> send(HttpRequest request,
                 HttpResponse.BodyHandler<T> handler) {
+            sentRequests.add(request);
             sentSessions.add(request.headers().firstValue("Mcp-Session-Id").orElse(null));
             sentAuths.add(request.headers().firstValue("Authorization").orElse(null));
             Stub s = script.get(idx++);
