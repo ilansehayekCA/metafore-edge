@@ -776,7 +776,10 @@ class SqlExecutorTest {
     //       emission asserting LIMIT ? + bind discipline in
     //       executeParametricRead validation tests; full
     //       row-trimming verified at smoke-test layer)
-    //   (g) limit clamped to MAX_ROWS-1 when caller asks for more
+    //   (g) limit bounded by min(requestedLimit, payload max_page_size,
+    //       MAX_PAGE_SIZE) — decoupled from the MAX_ROWS memory safety
+    //       net (which now only guards the non-keyset paths). TODO: add
+    //       an executeParametricRead ceiling test (needs a DataSource).
     //
     // SQL emission is the primary test surface (deterministic, no DB).
     // executeParametricRead validation gates are tested with null
