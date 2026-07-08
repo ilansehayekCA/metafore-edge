@@ -43,7 +43,16 @@ public final class SqlExecutor {
         "uuid"
     );
 
-    private static final int MAX_ROWS = 100;
+    // Hard per-page read cap on the edge. Keyset reads clamp the effective
+    // page to MAX_ROWS - 1 (a single page therefore returns at most 199 rows),
+    // and the SELECT loop stops at MAX_ROWS. Raised 100 -> 200 so a consumer
+    // that requests a large page (e.g. InternalCRM's list views, which pass
+    // limit >= the record count) can pull a full list of up to 199 rows in one
+    // page instead of being truncated at 99. NOTE: the platform's consumer
+    // policy still applies its own ceiling first (role_agent list max = 200,
+    // default_limit = 50) — callers must pass an explicit limit above 50 to see
+    // the benefit; sets larger than 199 must still paginate via next_cursor.
+    private static final int MAX_ROWS = 200;
 
     /** Phase 14.6 / A6 — default schema when ``table_name`` is bare
      *  (unqualified). Matches PG's behaviour for queries without an
