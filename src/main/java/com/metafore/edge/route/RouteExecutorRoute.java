@@ -339,8 +339,16 @@ public class RouteExecutorRoute extends RouteBuilder {
         List<Map<String, Object>> data =
             (List<Map<String, Object>>) execResult.get("data");
         String error = (String) execResult.get("error");
+        // Keyset pagination: executeParametricRead sets has_more +
+        // last_keyset_value on a keyset list read; forward them so the
+        // dispatcher can page instead of treating the capped page as
+        // complete. Absent (non-keyset reads) -> null -> omitted from the
+        // envelope, preserving the pre-keyset reply shape exactly.
+        Boolean hasMore = (Boolean) execResult.get("has_more");
+        Object lastKeysetValue = execResult.get("last_keyset_value");
         return MessageFactory.routeResult(config, routeId,
-            status, action, latency, rowCount, null, data, error, null);
+            status, action, latency, rowCount, null, data, error, null,
+            hasMore, lastKeysetValue);
     }
 
     /**

@@ -236,6 +236,44 @@ class MessageFactoryTest {
     }
 
     @Test
+    void routeResultKeysetHasMoreIsForwardedAndMatchesSchema() throws Exception {
+        // A keyset list page with more rows behind it: has_more + the cursor
+        // value must reach the dispatcher, or it treats the capped page as
+        // complete (silent truncation). Regression for the envelope dropping
+        // the pagination fields SqlExecutor computes.
+        List<Map<String, Object>> data = List.of(Map.of("record_id", "r-99"));
+        Map<String, Object> msg = MessageFactory.routeResult(
+            config, "route-004", "success", "query", 7,
+            1, null, data, null, null, true, "r-99");
+        assertEquals(Boolean.TRUE, msg.get("has_more"));
+        assertEquals("r-99", msg.get("last_keyset_value"));
+        validate(msg, "route_result.schema.json");
+    }
+
+    @Test
+    void routeResultTerminalKeysetPageOmitsPaginationFields() throws Exception {
+        // Last page (has_more=false, no cursor): both fields omitted, so a
+        // non-keyset consumer sees the exact pre-keyset shape.
+        Map<String, Object> msg = MessageFactory.routeResult(
+            config, "route-005", "success", "query", 7,
+            1, null, List.of(), null, null, false, null);
+        assertEquals(Boolean.FALSE, msg.get("has_more"));
+        assertFalse(msg.containsKey("last_keyset_value"));
+        validate(msg, "route_result.schema.json");
+    }
+
+    @Test
+    void routeResultBackCompatOverloadOmitsPaginationFields() throws Exception {
+        // The 10-arg overload (non-keyset callers) must not introduce the keys.
+        Map<String, Object> msg = MessageFactory.routeResult(
+            config, "route-006", "success", "query", 5,
+            0, null, List.of(), null, null);
+        assertFalse(msg.containsKey("has_more"));
+        assertFalse(msg.containsKey("last_keyset_value"));
+        validate(msg, "route_result.schema.json");
+    }
+
+    @Test
     void writeBackResultSuccessMatchesSchema() throws Exception {
         Map<String, Object> msg = MessageFactory.writeBackResult(
             config, "wb-001", "success", 200,
