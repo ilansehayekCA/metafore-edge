@@ -1445,6 +1445,15 @@ public final class SqlExecutor {
                 if (i > 0) pb.append(", ");
                 pb.append('"').append(columns.get(i)).append('"');
             }
+            // Keyset pagination reads the cursor (last_keyset_value) off the
+            // keyset_field of the last returned row, so that column MUST be in
+            // the projection — even when the caller didn't ask for it. Without
+            // this, the row has no keyset_field, executeParametricRead surfaces
+            // last_keyset_value=null despite has_more=true, and the dispatcher
+            // cannot page forward. Append it once, only when absent.
+            if (keysetMode && !columns.contains(keysetField)) {
+                pb.append(", \"").append(keysetField).append('"');
+            }
             proj = pb.toString();
         }
 

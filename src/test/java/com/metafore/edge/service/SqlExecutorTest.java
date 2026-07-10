@@ -863,6 +863,40 @@ class SqlExecutorTest {
     }
 
     @Test
+    void buildReadSqlKeysetAddsKeysetFieldToProjectionWhenAbsent() {
+        // The dispatcher projects business columns and may omit record_id,
+        // but keyset pagination reads the cursor off keyset_field. It MUST be
+        // selected or last_keyset_value comes back null and paging stalls.
+        String sql = SqlExecutor.buildReadSql(
+            "list", "opportunities",
+            java.util.List.of("deal_title", "value"),   // no record_id
+            null, 0, false,
+            "record_id", false
+        );
+        assertEquals(
+            "SELECT \"deal_title\", \"value\", \"record_id\" "
+            + "FROM \"opportunities\" ORDER BY \"record_id\" ASC LIMIT ?",
+            sql
+        );
+    }
+
+    @Test
+    void buildReadSqlKeysetDoesNotDuplicateKeysetFieldWhenPresent() {
+        // Already-projected keyset_field must not be appended twice.
+        String sql = SqlExecutor.buildReadSql(
+            "list", "opportunities",
+            java.util.List.of("record_id", "deal_title"),
+            null, 0, false,
+            "record_id", false
+        );
+        assertEquals(
+            "SELECT \"record_id\", \"deal_title\" FROM \"opportunities\" "
+            + "ORDER BY \"record_id\" ASC LIMIT ?",
+            sql
+        );
+    }
+
+    @Test
     void buildReadSqlKeysetWithCursorNoFilter() {
         // Acceptance case (c) — second-page fetch: keyset comparator
         // is the only WHERE predicate, plus ORDER BY + LIMIT.
