@@ -45,6 +45,17 @@ public final class SqlExecutor {
 
     private static final int MAX_ROWS = 100;
 
+    // Absolute page-size ceiling for keyset (``list``) reads. This is
+    // DECOUPLED from MAX_ROWS: MAX_ROWS is the legacy per-fetch memory
+    // safety net for the non-keyset paths (generic select loop + the
+    // by_ids IN-list guard); MAX_PAGE_SIZE is the negotiated pagination
+    // ceiling. Conflating the two capped every keyset page at 99 and
+    // silently defeated the adapter's declared pagination.read.max_page_size
+    // (postgres_managed / postgres_external manifests = 2000). Kept in sync
+    // with that manifest value; the effective per-call ceiling is
+    // min(requestedLimit, payload "max_page_size" when present, MAX_PAGE_SIZE).
+    private static final int MAX_PAGE_SIZE = 2000;
+
     /** Phase 14.6 / A6 — default schema when ``table_name`` is bare
      *  (unqualified). Matches PG's behaviour for queries without an
      *  explicit ``search_path`` override. */
@@ -774,10 +785,13 @@ public final class SqlExecutor {
      *                                              //   pivot (WHERE "$keyset_field" > ?).
      *                                              //   null/missing means "start from beginning"
      *                                              //   (no WHERE clause on the keyset column).
+     *   max_page_size:       INT | null            // OPTIONAL — adapter's declared page ceiling
+     *                                              //   (pagination.read.max_page_size). Caps the
+     *                                              //   effective limit; falls back to MAX_PAGE_SIZE.
      *   limit:               INT | null            // REQUIRED when keyset_field is set; page size.
-     *                                              //   Clamped to MAX_ROWS-1 (= 99) to keep the
-     *                                              //   safety net. Edge fetches limit+1 rows
-     *                                              //   internally to derive has_more.
+     *                                              //   Clamped to min(requestedLimit, max_page_size,
+     *                                              //   MAX_PAGE_SIZE) — NOT MAX_ROWS. Edge fetches
+     *                                              //   limit+1 rows internally to derive has_more.
      * }
      * </pre>
      *
@@ -915,9 +929,20 @@ public final class SqlExecutor {
                 return errorResult(start, "query",
                     "limit must be positive (got " + requestedLimit + ")");
             }
-            // Clamp at MAX_ROWS-1 so limit+1 cannot exceed MAX_ROWS and
-            // the existing in-loop MAX_ROWS safety net stays intact.
-            effectiveLimit = Math.min(requestedLimit, MAX_ROWS - 1);
+            // Page size is bounded by the adapter's declared ceiling
+            // (payload "max_page_size", forwarded by the dispatcher), then
+            // by the edge's absolute MAX_PAGE_SIZE safety ceiling — NOT by
+            // MAX_ROWS. The has_more sentinel (limit+1) is honored by
+            // fetchCap below, which uses effectiveLimit+1 in keyset mode.
+            int pageCeiling = MAX_PAGE_SIZE;
+            Object maxPageSizeObj = payload.get("max_page_size");
+            if (maxPageSizeObj instanceof Number) {
+                int declared = ((Number) maxPageSizeObj).intValue();
+                if (declared > 0) {
+                    pageCeiling = Math.min(pageCeiling, declared);
+                }
+            }
+            effectiveLimit = Math.min(requestedLimit, pageCeiling);
         }
 
         // Pattern-specific required fields.
