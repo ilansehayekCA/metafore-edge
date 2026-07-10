@@ -23,7 +23,14 @@
     "http_status": { "type": "integer", "description": "HTTP status code for REST routes" },
     "response_body": { "description": "Response body for REST routes" },
     "error": { "type": "string" },
-    "error_details": { "type": "string" }
+    "error_details": { "type": "string" },
+    "has_more": {
+      "type": "boolean",
+      "description": "Keyset pagination: true when more rows exist beyond this page. Present only on keyset list reads."
+    },
+    "last_keyset_value": {
+      "description": "Keyset pagination: the keyset_field value of the last returned row; the dispatcher encodes it as the next cursor. Present only when has_more is true."
+    }
   },
   "additionalProperties": false
 }

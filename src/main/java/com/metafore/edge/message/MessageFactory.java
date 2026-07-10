@@ -145,6 +145,27 @@ public final class MessageFactory {
             String status, String action, long latencyMs,
             Integer rowCount, Integer rowsAffected, List<Map<String, Object>> data,
             String error, String errorDetails) {
+        // Back-compat overload: non-keyset callers carry no pagination signal.
+        return routeResult(config, routeId, status, action, latencyMs,
+            rowCount, rowsAffected, data, error, errorDetails, null, null);
+    }
+
+    /**
+     * Route-result envelope with keyset pagination carried through.
+     *
+     * ``SqlExecutor.executeParametricRead`` computes ``has_more`` +
+     * ``last_keyset_value`` for a keyset list read, but the envelope had no
+     * slot for them, so ``executeRead`` dropped them and the dispatcher saw
+     * every page as terminal (silent truncation at the page cap). Forward them
+     * here — omitted (not emitted as null) when absent so non-keyset replies
+     * are byte-for-byte unchanged, and so the dispatcher can distinguish
+     * "no more rows" from "field not reported".
+     */
+    public static Map<String, Object> routeResult(EdgeConfig config, String routeId,
+            String status, String action, long latencyMs,
+            Integer rowCount, Integer rowsAffected, List<Map<String, Object>> data,
+            String error, String errorDetails,
+            Boolean hasMore, Object lastKeysetValue) {
         Map<String, Object> msg = new LinkedHashMap<>();
         msg.put("controller_id", config.controllerId());
         msg.put("tenant_id", config.tenantId());
@@ -169,6 +190,12 @@ public final class MessageFactory {
         }
         if (errorDetails != null) {
             msg.put("error_details", errorDetails);
+        }
+        if (hasMore != null) {
+            msg.put("has_more", hasMore);
+        }
+        if (lastKeysetValue != null) {
+            msg.put("last_keyset_value", lastKeysetValue);
         }
         return msg;
     }
