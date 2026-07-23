@@ -128,7 +128,11 @@ public final class Capabilities {
                     return "read";
                 }
                 if ("create".equals(opStr) || "update".equals(opStr)
-                    || "delete".equals(opStr)) {
+                    || "delete".equals(opStr)
+                    // adr-196 — transactional record-write + change-event
+                    // emit is a write (it mutates the record + appends an
+                    // immutable event row in one transaction).
+                    || "write_with_events".equals(opStr)) {
                     return "write";
                 }
             }

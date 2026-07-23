@@ -279,6 +279,14 @@ public class RouteExecutorRoute extends RouteBuilder {
             return executeRead(routeId, ds, params);
         }
 
+        // adr-196 — transactional record-write + change-event emit. The
+        // record write and its derived change-events commit in ONE JDBC
+        // transaction (SqlExecutor.executeWriteWithEvents); the payload
+        // carries the record write plus a generic field->event_type map.
+        if ("write_with_events".equals(operation)) {
+            return executeWriteWithEvents(routeId, ds, params);
+        }
+
         String tableName = (String) params.get("table_name");
         Object colsObj = params.get("columns");
         Object valsObj = params.get("values");
@@ -349,6 +357,36 @@ public class RouteExecutorRoute extends RouteBuilder {
         return MessageFactory.routeResult(config, routeId,
             status, action, latency, rowCount, null, data, error, null,
             hasMore, lastKeysetValue);
+    }
+
+    /**
+     * adr-196 — dispatch a transactional record-write-with-events to
+     * {@link SqlExecutor#executeWriteWithEvents}. The record write and
+     * its derived change-events commit atomically in one JDBC
+     * transaction against the tenant PG.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> executeWriteWithEvents(
+        String routeId, DataSource ds, Map<String, Object> params
+    ) {
+        Map<String, Object> execResult =
+            SqlExecutor.executeWriteWithEvents(ds, params);
+        String status = (String) execResult.get("status");
+        String action = (String) execResult.getOrDefault(
+            "action", "write_with_events");
+        long latency = ((Number) execResult.get("latency_ms")).longValue();
+        Integer rowsAffected = (Integer) execResult.get("rows_affected");
+        String error = (String) execResult.get("error");
+        Map<String, Object> result = MessageFactory.routeResult(config,
+            routeId, status, action, latency, null, rowsAffected, null,
+            error, null);
+        // Surface the emitted-event count so core can assert the audit
+        // trail landed without a follow-up read (Principle #46).
+        Object emitted = execResult.get("events_emitted");
+        if (emitted != null) {
+            result.put("events_emitted", emitted);
+        }
+        return result;
     }
 
     /**

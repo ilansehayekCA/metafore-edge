@@ -1511,12 +1511,449 @@ public final class SqlExecutor {
         return sql.toString();
     }
 
+    // ── adr-196 — transactional record write + change-event emit ──────
+
+    /** adr-196 — the generic change-event table name. Object-agnostic
+     *  (object_type + record_id, NOT case_id); supersedes the vestigial
+     *  domain-named ``case_events`` log. Lives in the tenant PG so the
+     *  edge can write it in the same JDBC transaction as the record. */
+    static final String RECORD_EVENT_TABLE = "record_event";
+
+    /**
+     * adr-196 R1 — execute a record write AND its derived change-events
+     * in ONE JDBC transaction against the tenant PG.
+     *
+     * <p>This is the durable, atomic emit the fire-and-forget
+     * platform-side path could never give: because managed writes run
+     * here at the edge (not in the platform process), the ONLY place the
+     * record write and the event insert can share a transaction is this
+     * method. Either both commit or neither does.
+     *
+     * <p>The platform derives NOTHING about which fields changed — it
+     * cannot, it has no pre-write view of the row. It sends the record
+     * write plus a declarative {@code events} block (a generic
+     * field→event_type map + scaffold); the edge SELECTs the old values,
+     * diffs them against the new values inside the transaction, and emits
+     * one immutable event per actually-changed tracked field. No domain
+     * literals: the edge reads a generic mapping, never a hardcoded
+     * "Case"/"status".
+     *
+     * <p>Payload shape:
+     * <pre>
+     * {
+     *   operation:       "write_with_events",
+     *   inner_operation: "create" | "update" | "delete",
+     *   table_name, columns:[...], values:[...],
+     *   where_column, where_value,               // update/delete
+     *   events: {
+     *     tenant_id, app_id, object_type, record_id,
+     *     actor:{...}|null, source, occurred_at (ISO), correlation_id,
+     *     action_id,                              // idempotency key
+     *     on_create:  "Created"|null,
+     *     on_delete:  "Deleted"|null,
+     *     field_events: { "<field>": "<EventType>", ... }
+     *   }
+     * }
+     * </pre>
+     *
+     * On success returns {@code {status, action:"write_with_events",
+     * rows_affected, events_emitted, latency_ms}}. On any failure the
+     * transaction is rolled back and a structured error envelope is
+     * returned — the record write is NOT applied if the event insert
+     * fails, which is the whole point.
+     */
+    @SuppressWarnings("unchecked")
+    public static Map<String, Object> executeWriteWithEvents(
+        DataSource ds, Map<String, Object> payload
+    ) {
+        long start = System.currentTimeMillis();
+
+        String innerOp = payload == null
+            ? null : (String) payload.get("inner_operation");
+        if (!Set.of("create", "update", "delete").contains(innerOp)) {
+            return errorResult(start, "write_with_events",
+                "inner_operation must be create/update/delete (got "
+                + innerOp + ")");
+        }
+        String tableName = (String) payload.get("table_name");
+        if (tableName == null || tableName.isBlank()) {
+            return errorResult(start, "write_with_events",
+                "Missing table_name");
+        }
+        Object colsObj = payload.get("columns");
+        Object valsObj = payload.get("values");
+        String whereColumn = (String) payload.get("where_column");
+        Object whereValue = payload.get("where_value");
+        Object eventsObj = payload.get("events");
+        if (!(eventsObj instanceof Map)) {
+            return errorResult(start, "write_with_events",
+                "Missing events block");
+        }
+        Map<String, Object> events = (Map<String, Object>) eventsObj;
+
+        List<String> columns = new ArrayList<>();
+        List<Object> values = new ArrayList<>();
+        if (colsObj instanceof List && valsObj instanceof List) {
+            for (Object c : (List<Object>) colsObj) {
+                columns.add(c == null ? null : c.toString());
+            }
+            values.addAll((List<Object>) valsObj);
+        }
+        if (columns.size() != values.size()) {
+            return errorResult(start, "write_with_events",
+                "columns and values must be equal length");
+        }
+        if (("update".equals(innerOp) || "delete".equals(innerOp))
+            && (whereColumn == null || whereColumn.isBlank())) {
+            return errorResult(start, "write_with_events",
+                innerOp + " requires where_column");
+        }
+
+        ParsedTableName parsedTable;
+        try {
+            parsedTable = parseTableName(tableName);
+        } catch (IllegalArgumentException e) {
+            return errorResult(start, "write_with_events", e.getMessage());
+        }
+
+        // field_events: generic { field -> event_type }. Object-agnostic.
+        Map<String, String> fieldEvents = new LinkedHashMap<>();
+        Object feObj = events.get("field_events");
+        if (feObj instanceof Map) {
+            for (Map.Entry<String, Object> e
+                    : ((Map<String, Object>) feObj).entrySet()) {
+                if (e.getValue() != null) {
+                    fieldEvents.put(e.getKey(), e.getValue().toString());
+                }
+            }
+        }
+
+        Connection conn = null;
+        try {
+            conn = ds.getConnection();
+            conn.setAutoCommit(false);
+
+            // Validate the record table/columns on THIS connection so the
+            // schema view is transactionally consistent with the write.
+            String validationError = validateTableAndColumns(
+                conn, parsedTable, columns, whereColumn);
+            if (validationError != null) {
+                conn.rollback();
+                return errorResult(start, "write_with_events",
+                    validationError);
+            }
+            String typeError = validateValueTypes(values, whereValue);
+            if (typeError != null) {
+                conn.rollback();
+                return errorResult(start, "write_with_events", typeError);
+            }
+
+            ensureRecordEventTable(conn);
+            Map<String, String> columnTypes = fetchColumnTypes(
+                conn, parsedTable);
+
+            // Diff capture — SELECT the tracked fields' old values BEFORE
+            // the write (update only; create has no prior row, delete
+            // needs no diff). Same transaction → consistent.
+            Map<String, Object> oldValues = new LinkedHashMap<>();
+            if ("update".equals(innerOp) && !fieldEvents.isEmpty()) {
+                oldValues = selectOldValues(
+                    conn, parsedTable,
+                    new ArrayList<>(fieldEvents.keySet()),
+                    whereColumn, whereValue, columnTypes);
+            }
+
+            // Apply the record write on this connection (no commit yet).
+            int rowsAffected = doRecordWrite(
+                conn, innerOp, parsedTable, columns, values,
+                whereColumn, whereValue, columnTypes);
+            if (("update".equals(innerOp) || "delete".equals(innerOp))
+                && rowsAffected == 0) {
+                conn.rollback();
+                return errorResult(start, "write_with_events",
+                    "record not found: " + parsedTable.display()
+                    + " where " + whereColumn + "=" + whereValue);
+            }
+
+            // Derive the events from the (old,new) diff and insert them
+            // in the SAME transaction.
+            List<Map<String, Object>> toEmit = deriveEvents(
+                innerOp, events, fieldEvents, columns, values, oldValues);
+            int emitted = insertRecordEvents(conn, events, toEmit);
+
+            conn.commit();
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("status", "success");
+            result.put("action", "write_with_events");
+            result.put("latency_ms", System.currentTimeMillis() - start);
+            result.put("rows_affected", rowsAffected);
+            result.put("events_emitted", emitted);
+            return result;
+        } catch (Exception e) {
+            if (conn != null) {
+                try { conn.rollback(); } catch (SQLException ignore) { }
+            }
+            return errorResult(start, "write_with_events", e.getMessage());
+        } finally {
+            if (conn != null) {
+                try { conn.setAutoCommit(true); } catch (SQLException ignore) { }
+                try { conn.close(); } catch (SQLException ignore) { }
+            }
+        }
+    }
+
+    /** Apply the record write on a caller-owned Connection (no commit).
+     *  Mirrors {@link #executeParametric}'s SQL build + bind, but reuses
+     *  the transaction the caller opened so the write joins the event
+     *  insert atomically. */
+    private static int doRecordWrite(
+        Connection conn, String innerOp, ParsedTableName parsed,
+        List<String> columns, List<Object> values,
+        String whereColumn, Object whereValue,
+        Map<String, String> columnTypes
+    ) throws SQLException {
+        String sql = buildSql(innerOp, parsed, columns, whereColumn);
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            int idx = 1;
+            for (int i = 0; i < values.size(); i++) {
+                bindValue(ps, idx++, values.get(i),
+                    columnTypes.get(columns.get(i)));
+            }
+            if ("update".equals(innerOp) || "delete".equals(innerOp)) {
+                bindValue(ps, idx, whereValue, columnTypes.get(whereColumn));
+            }
+            return ps.executeUpdate();
+        }
+    }
+
+    /** SELECT the pre-write values of {@code fields} for the target row.
+     *  Returns column→value (String form); missing row → empty map. */
+    private static Map<String, Object> selectOldValues(
+        Connection conn, ParsedTableName parsed, List<String> fields,
+        String whereColumn, Object whereValue,
+        Map<String, String> columnTypes
+    ) throws SQLException {
+        Map<String, Object> old = new LinkedHashMap<>();
+        // Only SELECT fields that actually exist on the table.
+        List<String> present = new ArrayList<>();
+        for (String f : fields) {
+            if (columnTypes.containsKey(f)) present.add(f);
+        }
+        if (present.isEmpty()) return old;
+        String sql = buildSql("select", parsed, present, whereColumn);
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            bindValue(ps, 1, whereValue, columnTypes.get(whereColumn));
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    for (String f : present) {
+                        Object v = rs.getObject(f);
+                        old.put(f, v != null ? v.toString() : null);
+                    }
+                }
+            }
+        }
+        return old;
+    }
+
+    /** Build the change-event rows to insert from the (old,new) diff.
+     *  create → one {@code on_create} event (all provided fields as new);
+     *  update → one event per tracked field whose value actually changed;
+     *  delete → one {@code on_delete} event. Returns each as
+     *  {event_type, changed_fields(JSON string)}. */
+    static List<Map<String, Object>> deriveEvents(
+        String innerOp, Map<String, Object> events,
+        Map<String, String> fieldEvents,
+        List<String> columns, List<Object> values,
+        Map<String, Object> oldValues
+    ) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        Map<String, Object> newByCol = new LinkedHashMap<>();
+        for (int i = 0; i < columns.size(); i++) {
+            newByCol.put(columns.get(i), values.get(i));
+        }
+        if ("create".equals(innerOp)) {
+            String onCreate = (String) events.get("on_create");
+            if (onCreate != null && !onCreate.isBlank()) {
+                Map<String, Object> cf = new LinkedHashMap<>();
+                for (Map.Entry<String, String> fe : fieldEvents.entrySet()) {
+                    if (newByCol.containsKey(fe.getKey())) {
+                        cf.put(fe.getKey(), diffEntry(
+                            null, newByCol.get(fe.getKey())));
+                    }
+                }
+                out.add(eventRow(onCreate, cf));
+            }
+        } else if ("delete".equals(innerOp)) {
+            String onDelete = (String) events.get("on_delete");
+            if (onDelete != null && !onDelete.isBlank()) {
+                out.add(eventRow(onDelete, new LinkedHashMap<>()));
+            }
+        } else { // update — one event per actually-changed tracked field
+            for (Map.Entry<String, String> fe : fieldEvents.entrySet()) {
+                String field = fe.getKey();
+                if (!newByCol.containsKey(field)) continue;
+                Object newVal = newByCol.get(field);
+                Object oldVal = oldValues.get(field);
+                if (valuesEqual(oldVal, newVal)) continue;  // no real change
+                Map<String, Object> cf = new LinkedHashMap<>();
+                cf.put(field, diffEntry(oldVal, newVal));
+                out.add(eventRow(fe.getValue(), cf));
+            }
+        }
+        return out;
+    }
+
+    private static Map<String, Object> diffEntry(Object oldV, Object newV) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("old", oldV == null ? null : oldV.toString());
+        m.put("new", newV == null ? null : newV.toString());
+        return m;
+    }
+
+    private static Map<String, Object> eventRow(
+        String eventType, Map<String, Object> changedFields
+    ) {
+        Map<String, Object> r = new LinkedHashMap<>();
+        r.put("event_type", eventType);
+        r.put("changed_fields", changedFields);
+        return r;
+    }
+
+    private static boolean valuesEqual(Object a, Object b) {
+        String sa = a == null ? null : a.toString();
+        String sb = b == null ? null : b.toString();
+        return Objects.equals(sa, sb);
+    }
+
+    /** INSERT the derived change-events into {@code record_event} on the
+     *  caller's transaction. JSONB columns are bound via {@code ?::jsonb}
+     *  with a serialized-JSON String param (PG casts text→jsonb), so the
+     *  generic SUPPORTED_PG_COLUMN_TYPES JSONB rejection doesn't apply on
+     *  this dedicated path. */
+    private static int insertRecordEvents(
+        Connection conn, Map<String, Object> events,
+        List<Map<String, Object>> toEmit
+    ) throws SQLException {
+        if (toEmit.isEmpty()) return 0;
+        String tenantId = str(events, "tenant_id");
+        String appId = str(events, "app_id");
+        String objectType = str(events, "object_type");
+        String recordId = str(events, "record_id");
+        String source = str(events, "source");
+        String occurredAt = str(events, "occurred_at");
+        String correlationId = str(events, "correlation_id");
+        String actionId = str(events, "action_id");
+        String actorJson = toJson(events.get("actor"));
+
+        String sql =
+            "INSERT INTO " + RECORD_EVENT_TABLE + " ("
+            + "event_id, tenant_id, app_id, object_type, record_id, "
+            + "event_type, changed_fields, actor, reason, source, "
+            + "occurred_at, action_id, correlation_id) VALUES ("
+            + "?, ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?, ?, "
+            + "?::timestamptz, ?, ?)";
+        int emitted = 0;
+        for (Map<String, Object> ev : toEmit) {
+            String eventType = (String) ev.get("event_type");
+            String changedJson = toJson(ev.get("changed_fields"));
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                int i = 1;
+                ps.setString(i++, java.util.UUID.randomUUID().toString());
+                ps.setString(i++, tenantId);
+                ps.setString(i++, appId);
+                ps.setString(i++, objectType);
+                ps.setString(i++, recordId);
+                ps.setString(i++, eventType);
+                ps.setString(i++, changedJson == null ? "{}" : changedJson);
+                ps.setString(i++, actorJson);
+                ps.setString(i++, null);  // reason (reserved)
+                ps.setString(i++, source);
+                ps.setString(i++, occurredAt != null ? occurredAt
+                    : java.time.OffsetDateTime.now(
+                        java.time.ZoneOffset.UTC).toString());
+                ps.setString(i++, actionId);
+                ps.setString(i, correlationId);
+                ps.executeUpdate();
+                emitted++;
+            }
+        }
+        return emitted;
+    }
+
+    /** Idempotent DDL for the tenant-local {@code record_event} table.
+     *  Runs on the caller's transaction (CREATE TABLE IF NOT EXISTS is
+     *  transactional in PG). Month-partitioned on {@code occurred_at},
+     *  mirroring the entity_history_hot / case_events precedent. */
+    static void ensureRecordEventTable(Connection conn) throws SQLException {
+        String parentDdl =
+            "CREATE TABLE IF NOT EXISTS " + RECORD_EVENT_TABLE + " ("
+            + "event_id TEXT NOT NULL, "
+            + "tenant_id TEXT NOT NULL, "
+            + "app_id TEXT, "
+            + "object_type TEXT NOT NULL, "
+            + "record_id TEXT NOT NULL, "
+            + "event_type TEXT NOT NULL, "
+            + "changed_fields JSONB NOT NULL DEFAULT '{}', "
+            + "actor JSONB, "
+            + "reason TEXT, "
+            + "source TEXT, "
+            + "occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+            + "action_id TEXT, "
+            + "correlation_id TEXT, "
+            + "PRIMARY KEY (event_id, occurred_at)"
+            + ") PARTITION BY RANGE (occurred_at)";
+        java.time.LocalDate today = java.time.OffsetDateTime.now(
+            java.time.ZoneOffset.UTC).toLocalDate();
+        java.time.LocalDate monthStart = today.withDayOfMonth(1);
+        java.time.LocalDate nextMonth = monthStart.plusMonths(1);
+        java.time.LocalDate monthAfter = nextMonth.plusMonths(1);
+        String p1 = recordEventPartitionSql(monthStart, nextMonth);
+        String p2 = recordEventPartitionSql(nextMonth, monthAfter);
+        String idx =
+            "CREATE INDEX IF NOT EXISTS record_event_record_idx ON "
+            + RECORD_EVENT_TABLE
+            + " (tenant_id, object_type, record_id, occurred_at DESC)";
+        try (Statement st = conn.createStatement()) {
+            st.execute(parentDdl);
+            st.execute(p1);
+            st.execute(p2);
+            st.execute(idx);
+        }
+    }
+
+    private static String recordEventPartitionSql(
+        java.time.LocalDate from, java.time.LocalDate to
+    ) {
+        String name = String.format("%s_y%04dm%02d", RECORD_EVENT_TABLE,
+            from.getYear(), from.getMonthValue());
+        return "CREATE TABLE IF NOT EXISTS " + name + " PARTITION OF "
+            + RECORD_EVENT_TABLE + " FOR VALUES FROM ('" + from
+            + "') TO ('" + to + "')";
+    }
+
+    private static String str(Map<String, Object> m, String k) {
+        Object v = m.get(k);
+        return v == null ? null : v.toString();
+    }
+
+    private static final com.fasterxml.jackson.databind.ObjectMapper
+        JSON = new com.fasterxml.jackson.databind.ObjectMapper();
+
+    private static String toJson(Object v) {
+        if (v == null) return null;
+        try {
+            return JSON.writeValueAsString(v);
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            return null;
+        }
+    }
+
     // security(adr-096): execute(DataSource, String) — which ran an
     // arbitrary caller-supplied SQL string via a plain JDBC ``Statement``
     // (no bind parameters) — has been REMOVED. Combined with the now-gone
     // substituteParams, this was the unescaped raw-SQL execution surface.
     // The edge no longer executes any free-form SQL string. Every database
-    // operation goes through executeParametric / executeParametricRead,
-    // which validate table + column existence against INFORMATION_SCHEMA
-    // and bind every value via PreparedStatement.
+    // operation goes through executeParametric / executeParametricRead /
+    // executeWriteWithEvents, which validate table + column existence
+    // against INFORMATION_SCHEMA and bind every value via PreparedStatement.
 }
