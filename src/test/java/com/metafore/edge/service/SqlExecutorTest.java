@@ -294,6 +294,49 @@ class SqlExecutorTest {
     }
 
     @Test
+    void bindValueNormalisesZuluTimestampOntoZonelessColumn() throws Exception {
+        // Every upstream API emits RFC 3339 (``...Z``). Rejecting it fails a
+        // write that carries MORE information than the column can hold, so the
+        // offset is applied and the instant stored as UTC.
+        BindCapture cap = new BindCapture();
+        SqlExecutor.bindValue(
+            cap.ps(), 3, "2026-07-30T16:23:30Z",
+            "timestamp without time zone"
+        );
+        assertEquals(1, cap.calls.size());
+        assertEquals("setTimestamp", cap.calls.get(0).method);
+        assertEquals(
+            java.sql.Timestamp.valueOf(
+                java.time.LocalDateTime.parse("2026-07-30T16:23:30")),
+            cap.calls.get(0).args[1]
+        );
+    }
+
+    @Test
+    void bindValueShiftsAnOffsetTimestampToUtcOnZonelessColumn() throws Exception {
+        // A non-zero offset must be APPLIED, not truncated — storing the wall
+        // clock would silently move the instant by the offset.
+        BindCapture cap = new BindCapture();
+        SqlExecutor.bindValue(
+            cap.ps(), 3, "2026-07-30T16:23:30-04:00",
+            "timestamp without time zone"
+        );
+        assertEquals(
+            java.sql.Timestamp.valueOf(
+                java.time.LocalDateTime.parse("2026-07-30T20:23:30")),
+            cap.calls.get(0).args[1]
+        );
+    }
+
+    @Test
+    void bindValueStillRejectsAnUnparseableTimestamp() throws Exception {
+        // The fallback must not turn a genuine data error into a silent pass.
+        BindCapture cap = new BindCapture();
+        assertThrows(java.sql.SQLException.class, () -> SqlExecutor.bindValue(
+            cap.ps(), 3, "not-a-timestamp", "timestamp without time zone"));
+    }
+
+    @Test
     void bindValueKeepsExistingPathForVarcharColumn() throws Exception {
         // Regression: non-timestamp column + String value MUST still
         // hit setString (legacy path). ISO-like strings landing on a

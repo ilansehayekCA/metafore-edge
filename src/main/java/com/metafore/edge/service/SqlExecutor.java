@@ -677,15 +677,28 @@ public final class SqlExecutor {
                 return;
             }
             if (columnType.contains("timestamp")) {
-                // ``timestamp without time zone`` — accept naive ISO.
+                // ``timestamp without time zone`` — accept naive ISO, AND an
+                // offset-bearing one normalised to UTC. A zoned instant landing
+                // in a zone-less column is a CONVERSION, not a parse failure:
+                // every upstream API emits ``...Z`` (RFC 3339), so rejecting it
+                // fails writes that carry strictly more information than the
+                // column can hold. UTC is the only defensible normalisation —
+                // guessing a local zone would silently shift the instant.
                 try {
                     ps.setTimestamp(idx, java.sql.Timestamp.valueOf(
                         java.time.LocalDateTime.parse(s)));
-                } catch (java.time.format.DateTimeParseException e) {
-                    throw new SQLException(
-                        "Invalid ISO timestamp string for column type "
-                        + "'" + columnType + "': " + s
-                        + " (" + e.getMessage() + ")", e);
+                } catch (java.time.format.DateTimeParseException naive) {
+                    try {
+                        ps.setTimestamp(idx, java.sql.Timestamp.valueOf(
+                            java.time.OffsetDateTime.parse(s)
+                                .withOffsetSameInstant(java.time.ZoneOffset.UTC)
+                                .toLocalDateTime()));
+                    } catch (java.time.format.DateTimeParseException zoned) {
+                        throw new SQLException(
+                            "Invalid ISO timestamp string for column type "
+                            + "'" + columnType + "': " + s
+                            + " (" + naive.getMessage() + ")", naive);
+                    }
                 }
                 return;
             }
