@@ -87,6 +87,9 @@ public class AccessController {
                 config, tenantTopics, dsRegistry));
             context.addRoutes(new EventRoute(config, tenantTopics));
             context.addRoutes(new RestAdapterRoute(config, tenantTopics));
+            // G5 / adr-228 — scheduled collection of a partner-delivered file.
+            // At the edge because the drop location is the customer's.
+            context.addRoutes(new FileFeedRoute(config, tenantTopics));
         }
 
         context.start();
