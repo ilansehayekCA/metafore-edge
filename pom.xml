@@ -45,6 +45,37 @@
       <artifactId>camel-jdbc</artifactId>
       <version>${camel.version}</version>
     </dependency>
+    <!-- G5 / adr-228 — scheduled collection of a delivered file. A partner
+         that drops a periodic file could not be integrated at all: there was no
+         file consumer at either tier, and the edge does not build routes from
+         configuration, so no escape hatch could supply one. At the EDGE because
+         the drop location is the customer's: a customer who wants the file on
+         their own SFTP, or produced by an internal system rather than fetched
+         from a third party, repoints the edge and core never learns where it
+         came from. -->
+    <dependency>
+      <groupId>org.apache.camel</groupId>
+      <artifactId>camel-file</artifactId>
+      <version>${camel.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.camel</groupId>
+      <artifactId>camel-ftp</artifactId>
+      <version>${camel.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.camel</groupId>
+      <artifactId>camel-csv</artifactId>
+      <version>${camel.version}</version>
+    </dependency>
+    <!-- CsvMapper for header-bearing partner files. Declared explicitly rather
+         than leaned on transitively: camel-csv uses commons-csv, so relying on
+         this arriving by accident is how a build breaks on a dependency bump. -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.dataformat</groupId>
+      <artifactId>jackson-dataformat-csv</artifactId>
+      <version>2.17.2</version>
+    </dependency>
 
     <!-- Database -->
     <dependency>
