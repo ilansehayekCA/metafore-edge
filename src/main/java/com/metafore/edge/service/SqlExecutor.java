@@ -1857,6 +1857,12 @@ public final class SqlExecutor {
         String correlationId = str(events, "correlation_id");
         String actionId = str(events, "action_id");
         String actorJson = toJson(events.get("actor"));
+        // WHY the change happened, in one readable line. The column was bound
+        // to null from the start and was null on all 1,352 rows in phluence, so
+        // the store could say what changed and who held the pen and nothing at
+        // all about what caused it. Supplied by the platform's ambient write
+        // cause; absent for an un-annotated write, which is honestly unexplained.
+        String reason = str(events, "reason");
 
         String sql =
             "INSERT INTO " + RECORD_EVENT_TABLE + " ("
@@ -1879,7 +1885,7 @@ public final class SqlExecutor {
                 ps.setString(i++, eventType);
                 ps.setString(i++, changedJson == null ? "{}" : changedJson);
                 ps.setString(i++, actorJson);
-                ps.setString(i++, null);  // reason (reserved)
+                ps.setString(i++, reason);
                 ps.setString(i++, source);
                 ps.setString(i++, occurredAt != null ? occurredAt
                     : java.time.OffsetDateTime.now(
