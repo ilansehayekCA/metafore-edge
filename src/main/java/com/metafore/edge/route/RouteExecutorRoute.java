@@ -163,7 +163,15 @@ public class RouteExecutorRoute extends RouteBuilder {
             String dbName = str(params, "db_name", "DB_NAME", "");
             String dbUser = str(params, "db_user", "DB_USER", "root");
             String dbPass = str(params, "db_pass", "DB_PASS", "");
-            dsRegistry.register(routeId, dbHost, dbPort, dbName, dbUser, dbPass);
+            // adr — one pool per DATABASE, not one per request. Core mints a
+            // fresh route id per invocation for correlation, so registering
+            // under it made every read and write leak a connection pool: 3,121
+            // of them on the phluence controller before the JVM ran out of heap
+            // and stopped answering route commands (2026-08-30). The pool
+            // depends on where it connects, not on who asked.
+            dsRegistry.register(
+                DataSourceRegistry.connectionKey(dbHost, dbPort, dbName, dbUser),
+                dbHost, dbPort, dbName, dbUser, dbPass);
         }
 
         // Check for shell command
@@ -251,6 +259,27 @@ public class RouteExecutorRoute extends RouteBuilder {
     }
 
     /**
+     * Which pool serves this command.
+     *
+     * The connection key when the command carries db params — the same key
+     * {@code handleExecute} registered under. Falls back to the route id, then
+     * (via the registry) to "default", so a command shaped differently than
+     * expected still reaches a database rather than failing with "no database
+     * connection available".
+     */
+    private static String dataSourceKey(Map<String, Object> params, String routeId) {
+        if (params != null
+            && (params.containsKey("db_host") || params.containsKey("DB_HOST"))) {
+            return DataSourceRegistry.connectionKey(
+                str(params, "db_host", "DB_HOST", "localhost"),
+                str(params, "db_port", "DB_PORT", "5432"),
+                str(params, "db_name", "DB_NAME", ""),
+                str(params, "db_user", "DB_USER", "root"));
+        }
+        return routeId;
+    }
+
+    /**
      * Slice 33.1.0 — parametric CRUD dispatch via JDBC PreparedStatement.
      * Reads structured payload, delegates to
      * ``SqlExecutor.executeParametric`` which validates table +
@@ -260,7 +289,7 @@ public class RouteExecutorRoute extends RouteBuilder {
     private Map<String, Object> executeParametric(
         String routeId, Map<String, Object> params
     ) {
-        DataSource ds = dsRegistry.get(routeId);
+        DataSource ds = dsRegistry.get(dataSourceKey(params, routeId));
         if (ds == null) {
             return MessageFactory.routeResult(config, routeId,
                 "error", "execute", 0, null, null, null,
