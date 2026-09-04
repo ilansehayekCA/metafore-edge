@@ -2,7 +2,7 @@ name: CI/CD — metafore-edge
 
 on:
   push:
-    branches: [main]
+    branches: [main, staging]
   pull_request:
     branches: [main]
 
@@ -44,7 +44,10 @@ jobs:
 
   build-and-deploy:
     needs: test
-    if: github.ref == 'refs/heads/main'
+    # main -> production; staging -> the metafore-staging cluster. Staging does
+    # NOT touch the `:latest` tag or the GHCR mirror (those stay prod-only) so a
+    # staging build can never be pulled by prod's `rollout restart` on :latest.
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -66,11 +69,16 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push Docker image
+        # Always push the SHA tag. Push :latest ONLY on main — prod's edge deploy
+        # is a `rollout restart` that re-pulls :latest, so a staging build must
+        # never overwrite it.
         run: |
           docker build -t $ECR_REGISTRY/metafore-ilan/metafore-edge:${{ github.sha }} .
-          docker build -t $ECR_REGISTRY/metafore-ilan/metafore-edge:latest .
           docker push $ECR_REGISTRY/metafore-ilan/metafore-edge:${{ github.sha }}
-          docker push $ECR_REGISTRY/metafore-ilan/metafore-edge:latest
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            docker tag $ECR_REGISTRY/metafore-ilan/metafore-edge:${{ github.sha }} $ECR_REGISTRY/metafore-ilan/metafore-edge:latest
+            docker push $ECR_REGISTRY/metafore-ilan/metafore-edge:latest
+          fi
         env:
           ECR_REGISTRY: 359469026479.dkr.ecr.us-east-1.amazonaws.com
 
@@ -88,6 +96,7 @@ jobs:
       # Package settings → Change visibility → Public, otherwise the
       # wizard's `docker pull` from a customer laptop hits a 401.
       - name: Login to GHCR
+        if: github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -95,6 +104,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push to GHCR
+        if: github.ref == 'refs/heads/main'
         run: |
           # GHCR / Docker registry paths must be lowercase; the owner
           # slug `ilansehayekCA` is mixed-case so we downcase before
@@ -110,6 +120,16 @@ jobs:
           ECR_REGISTRY: 359469026479.dkr.ecr.us-east-1.amazonaws.com
 
       - name: Deploy to EKS
+        # staging: pin the edge deployment to the pushed SHA on the metafore-staging
+        # cluster. main: unchanged — rollout restart re-pulls :latest on prod.
         run: |
-          aws eks update-kubeconfig --name metafore-ilan-project-dev --region us-east-1
-          kubectl rollout restart deployment/metafore-edge -n metafore
+          if [ "${{ github.ref }}" = "refs/heads/staging" ]; then
+            aws eks update-kubeconfig --name metafore-staging --region us-east-1
+            kubectl set image deployment/metafore-edge -n metafore edge=$ECR_REGISTRY/metafore-ilan/metafore-edge:${{ github.sha }}
+            kubectl rollout status deployment/metafore-edge -n metafore --timeout=300s
+          else
+            aws eks update-kubeconfig --name metafore-ilan-project-dev --region us-east-1
+            kubectl rollout restart deployment/metafore-edge -n metafore
+          fi
+        env:
+          ECR_REGISTRY: 359469026479.dkr.ecr.us-east-1.amazonaws.com
